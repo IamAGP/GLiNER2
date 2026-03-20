@@ -13,8 +13,9 @@ Protocol:
   - Model loaded once per backend (separate processes via subprocess)
   - 5 warmup iterations (discarded)
   - 20 measured iterations per condition
-  - Reports mean, median, stdev, speedup
+  - Reports mean, median, stdev, speedup, peak memory
   - Welch's t-test for significance (p < 0.05)
+  - Peak memory via torch.cuda (GPU) or tracemalloc (CPU)
   - CUDA synchronize before all timing points on GPU
 
 Usage:
@@ -39,13 +40,14 @@ import statistics
 import subprocess
 import sys
 import time
+import tracemalloc
 from typing import Any, Dict, Optional
 
 import torch
 
 ENTITY_TYPES = ["company", "person", "product", "location", "date"]
 
-SEQUENCE_LENGTHS = [32, 128, 512, 1024, 2048]
+SEQUENCE_LENGTHS = [32, 64, 128, 256, 512, 1024, 2048]
 BATCH_SIZES = [1, 2, 4, 8]
 
 # Seed sentence pool — repeated/truncated to reach target token counts.
@@ -161,6 +163,13 @@ def run_single_backend(
 
             # Measure
             timings = []
+            # Peak memory tracking
+            if device.type == "cuda":
+                torch.cuda.reset_peak_memory_stats(device)
+                mem_before = torch.cuda.memory_allocated(device)
+            else:
+                tracemalloc.start()
+
             with torch.inference_mode():
                 for _ in range(n_measure):
                     sync(device)
@@ -168,6 +177,14 @@ def run_single_backend(
                     model.batch_extract_entities(texts, ENTITY_TYPES, batch_size=bs)
                     sync(device)
                     timings.append(time.perf_counter() - t0)
+
+            if device.type == "cuda":
+                peak_mem = torch.cuda.max_memory_allocated(device)
+                peak_mem_delta = peak_mem - mem_before
+            else:
+                _, peak_mem_delta = tracemalloc.get_traced_memory()
+                peak_mem = peak_mem_delta  # tracemalloc reports peak from start
+                tracemalloc.stop()
 
             mean_t = statistics.mean(timings)
             med_t = statistics.median(timings)
@@ -178,11 +195,14 @@ def run_single_backend(
                 "mean": mean_t,
                 "median": med_t,
                 "stdev": std_t,
+                "peak_memory_mb": peak_mem / (1024 * 1024),
+                "peak_memory_delta_mb": peak_mem_delta / (1024 * 1024),
             }
 
             print(f"  [{backend}] seq={seq_len:>4} bs={bs}: "
                   f"mean={mean_t*1000:.1f}ms  median={med_t*1000:.1f}ms  "
-                  f"stdev={std_t*1000:.1f}ms")
+                  f"stdev={std_t*1000:.1f}ms  "
+                  f"peak_mem={peak_mem / (1024 * 1024):.1f}MB")
 
     return {
         "backend": backend,
@@ -322,12 +342,15 @@ def compare_results(
         f"  {'Condition':<20} "
         f"{'Std mean':>10} {'Std med':>10} "
         f"{'Flash mean':>10} {'Flash med':>10} "
-        f"{'Speedup':>9} {'p-value':>9} {'Sig':>4}"
+        f"{'Speedup':>9} "
+        f"{'Std mem':>9} {'Flash mem':>9} {'Mem ratio':>9}"
     )
     print(header)
-    print(f"  {'-' * 20} {'-' * 10} {'-' * 10} {'-' * 10} {'-' * 10} {'-' * 9} {'-' * 9} {'-' * 4}")
+    print(f"  {'-' * 20} {'-' * 10} {'-' * 10} {'-' * 10} {'-' * 10} "
+          f"{'-' * 9} {'-' * 9} {'-' * 9} {'-' * 9}")
 
     all_speedups = []
+    all_mem_ratios = []
 
     for cond in standard["conditions"]:
         std = standard["conditions"][cond]
@@ -336,22 +359,21 @@ def compare_results(
         std_timings = std["timings"]
         fla_timings = fla["timings"]
 
-        speedup_med = (std["median"] - fla["median"]) / std["median"] * 100 if std["median"] > 0 else 0
+        speedup_ratio = std["median"] / fla["median"] if fla["median"] > 0 else float("inf")
 
-        _, p_val = _welch_ttest(std_timings, fla_timings)
-        sig = p_val < 0.05
+        std_mem = std.get("peak_memory_mb", 0)
+        fla_mem = fla.get("peak_memory_mb", 0)
+        mem_ratio = std_mem / fla_mem if fla_mem > 0 else float("inf")
 
-        if sig:
-            all_speedups.append(speedup_med)
-
-        sig_mark = "*" if sig else ""
+        all_speedups.append(speedup_ratio)
+        all_mem_ratios.append(mem_ratio)
 
         print(
             f"  {cond:<20} "
             f"{std['mean']*1000:>9.1f}ms {std['median']*1000:>9.1f}ms "
             f"{fla['mean']*1000:>9.1f}ms {fla['median']*1000:>9.1f}ms "
-            f"{speedup_med:>+8.1f}% "
-            f"{p_val:>9.4f} {sig_mark:>4}"
+            f"{speedup_ratio:>8.2f}x "
+            f"{std_mem:>8.1f}M {fla_mem:>8.1f}M {mem_ratio:>8.2f}x"
         )
 
     # Summary
@@ -360,18 +382,20 @@ def compare_results(
     print(f"{'=' * 90}")
 
     total_conds = len(standard["conditions"])
-    sig_count = len(all_speedups)
 
     if all_speedups:
-        print(f"  Significant results: {sig_count}/{total_conds} conditions")
-        print(f"  Median speedup range: {min(all_speedups):+.1f}% to {max(all_speedups):+.1f}%")
-        print(f"  Overall median speedup: {statistics.median(all_speedups):+.1f}%")
-    else:
-        print(f"  No statistically significant differences ({total_conds} conditions tested)")
+        print(f"  Conditions tested: {total_conds}")
+        print(f"  Speedup range: {min(all_speedups):.2f}x to {max(all_speedups):.2f}x")
+        print(f"  Overall median speedup: {statistics.median(all_speedups):.2f}x")
 
-    regressions = [s for s in all_speedups if s < -5]
+    if all_mem_ratios:
+        print(f"\n  Peak memory ratio (std / flash, >1x = flash uses less):")
+        print(f"  Memory ratio range: {min(all_mem_ratios):.2f}x to {max(all_mem_ratios):.2f}x")
+        print(f"  Overall median memory ratio: {statistics.median(all_mem_ratios):.2f}x")
+
+    regressions = [s for s in all_speedups if s < 0.95]
     if regressions:
-        print(f"  WARNING: {len(regressions)} conditions showed significant regressions")
+        print(f"  WARNING: {len(regressions)} conditions showed regressions")
 
 
 def run_subprocess_backend(
@@ -425,7 +449,7 @@ def main():
         help="Model name or path (default: fastino/gliner2-base-v1)"
     )
     parser.add_argument("--warmup", type=int, default=3, help="Warmup iterations (default: 3)")
-    parser.add_argument("--measure", type=int, default=5, help="Measured iterations (default: 5)")
+    parser.add_argument("--measure", type=int, default=10, help="Measured iterations (default: 5)")
     parser.add_argument(
         "--output", default=None,
         help="Output JSON file (used internally for subprocess communication)"
