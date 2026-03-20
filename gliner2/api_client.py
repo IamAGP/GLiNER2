@@ -344,6 +344,23 @@ class GLiNER2API:
         self.session.mount("http://", adapter)
         
         logger.debug(f"Initialized GLiNER2API for {self.base_url}")
+
+    @staticmethod
+    def _safe_json(response: requests.Response) -> Optional[Dict[str, Any]]:
+        """Parse response JSON safely, returning None for empty/invalid payloads."""
+        if not response.content:
+            return None
+
+        try:
+            data = response.json()
+        except ValueError:
+            logger.debug(
+                "Response body was not valid JSON (status=%s)",
+                response.status_code,
+            )
+            return None
+
+        return data if isinstance(data, dict) else None
     
     def _make_request(
         self,
@@ -400,15 +417,19 @@ class GLiNER2API:
             
             # Handle different error codes
             if response.status_code == 401:
-                error_data = response.json() if response.content else None
+                error_data = self._safe_json(response)
                 error_msg = (
                     error_data.get("detail", "Invalid or expired API key")
                     if error_data else "Invalid or expired API key"
                 )
-                raise AuthenticationError(error_msg, response_data=error_data)
+                raise AuthenticationError(
+                    error_msg,
+                    status_code=response.status_code,
+                    response_data=error_data,
+                )
             
             elif response.status_code in (400, 422):
-                error_data = response.json() if response.content else None
+                error_data = self._safe_json(response)
                 error_msg = (
                     error_data.get("detail", "Request validation failed")
                     if error_data else "Request validation failed"
@@ -420,7 +441,7 @@ class GLiNER2API:
                 )
             
             elif response.status_code >= 500:
-                error_data = response.json() if response.content else None
+                error_data = self._safe_json(response)
                 error_msg = (
                     error_data.get("detail", "Server error occurred")
                     if error_data else "Server error occurred"
@@ -432,7 +453,7 @@ class GLiNER2API:
                 )
             
             elif not response.ok:
-                error_data = response.json() if response.content else None
+                error_data = self._safe_json(response)
                 error_msg = (
                     error_data.get("detail", f"Request failed with status {response.status_code}")
                     if error_data else f"Request failed with status {response.status_code}"
@@ -442,8 +463,21 @@ class GLiNER2API:
                     status_code=response.status_code,
                     response_data=error_data,
                 )
-            
-            data = response.json()
+
+            if not response.content:
+                raise GLiNER2APIError(
+                    "Empty response body from API",
+                    status_code=response.status_code,
+                )
+
+            try:
+                data = response.json()
+            except ValueError as e:
+                raise GLiNER2APIError(
+                    "Invalid JSON response from API",
+                    status_code=response.status_code,
+                ) from e
+
             return data.get("result", data)
         
         except requests.exceptions.Timeout:
