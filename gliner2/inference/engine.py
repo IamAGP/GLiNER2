@@ -568,12 +568,18 @@ class GLiNER2(Extractor):
                 }
             else:
                 schema_dict = schema
+                # Normalize shorthand entity lists to dicts
+                # e.g. {'entities': ['person', 'company']} -> {'entities': {'person': '', 'company': ''}}
+                entities = schema_dict.get("entities")
+                if isinstance(entities, list):
+                    schema_dict = {**schema_dict, "entities": {e: "" for e in entities}}
                 # Extract classification task names from dict schema
                 classification_tasks = [c["task"] for c in schema_dict.get("classifications", [])]
+                entity_order = list(schema_dict["entities"].keys()) if isinstance(schema_dict.get("entities"), dict) else []
                 metadata = {
                     "field_metadata": {}, "entity_metadata": {},
                     "relation_metadata": {}, "field_orders": {},
-                    "entity_order": [], "relation_order": [],
+                    "entity_order": entity_order, "relation_order": [],
                     "classification_tasks": classification_tasks
                 }
 

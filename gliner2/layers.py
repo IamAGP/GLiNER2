@@ -3,6 +3,61 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+class CompileSafeGRU(nn.Module):
+    """Drop-in for single-layer ``nn.GRU`` that torch.compile can trace.
+
+    Uses the same parameter names (``weight_ih_l0``, ``weight_hh_l0``,
+    ``bias_ih_l0``, ``bias_hh_l0``) so pretrained checkpoints that were
+    saved with ``nn.GRU`` load without any key remapping.
+    """
+
+    def __init__(self, input_size: int, hidden_size: int):
+        super().__init__()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.weight_ih_l0 = nn.Parameter(torch.empty(3 * hidden_size, input_size))
+        self.weight_hh_l0 = nn.Parameter(torch.empty(3 * hidden_size, hidden_size))
+        self.bias_ih_l0 = nn.Parameter(torch.empty(3 * hidden_size))
+        self.bias_hh_l0 = nn.Parameter(torch.empty(3 * hidden_size))
+        self._reset_parameters()
+
+    def _reset_parameters(self):
+        stdv = 1.0 / (self.hidden_size ** 0.5)
+        for p in self.parameters():
+            nn.init.uniform_(p, -stdv, stdv)
+
+    def forward(self, x: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
+        """Run GRU over a sequence.
+
+        Args:
+            x: (seq_len, batch, input_size) input sequence.
+            h: (batch, hidden_size) initial hidden state.
+
+        Returns:
+            (seq_len, batch, hidden_size) — hidden state at each step.
+        """
+        seq_len = x.shape[0]
+        if seq_len == 0:
+            return x.new_empty(0, h.shape[0], self.hidden_size)
+
+        outputs = []
+        for t in range(seq_len):
+            gi = F.linear(x[t], self.weight_ih_l0, self.bias_ih_l0)
+            gh = F.linear(h, self.weight_hh_l0, self.bias_hh_l0)
+
+            i_r, i_z, i_n = gi.chunk(3, dim=-1)
+            h_r, h_z, h_n = gh.chunk(3, dim=-1)
+
+            r = torch.sigmoid(i_r + h_r)
+            z = torch.sigmoid(i_z + h_z)
+            n = torch.tanh(i_n + r * h_n)
+
+            h = (1 - z) * n + z * h
+            outputs.append(h)
+
+        return torch.stack(outputs, dim=0)
+
+
 def create_mlp(input_dim, intermediate_dims, output_dim, dropout=0.1, activation="gelu", add_layer_norm=False):
     """
     Creates a multi-layer perceptron (MLP) with specified dimensions and activation functions.
@@ -89,8 +144,8 @@ class CountLSTM(nn.Module):
         self.max_count = max_count
         # Learned positional embeddings for count steps: shape (max_count, hidden_size)
         self.pos_embedding = nn.Embedding(max_count, hidden_size)
-        # Use a GRU layer; input shape is (seq_len, batch, input_size)
-        self.gru = nn.GRU(input_size=hidden_size, hidden_size=hidden_size)
+        # Compile-safe GRU (same parameter names as nn.GRU for checkpoint compat)
+        self.gru = CompileSafeGRU(input_size=hidden_size, hidden_size=hidden_size)
         # Projector layer: combines GRU output with original embeddings.
         self.projector = create_mlp(
             input_dim=hidden_size * 2,
@@ -118,10 +173,8 @@ class CountLSTM(nn.Module):
         pos_seq = self.pos_embedding(count_indices)
         # Expand pos_seq over the batch dimension: (gold_count_val, M, hidden_size)
         pos_seq = pos_seq.unsqueeze(1).expand(gold_count_val, M, D)
-        # Initialize the GRU hidden state with the field embeddings.
-        h0 = pc_emb.unsqueeze(0)  # shape: (1, M, hidden_size)
-        # Run the GRU over the count sequence.
-        output, _ = self.gru(pos_seq, h0)
+        # Run compile-safe GRU.
+        output = self.gru(pos_seq, pc_emb)
         # Concatenate the GRU outputs with the original field embeddings.
         return self.projector(torch.cat([output, pc_emb.unsqueeze(0).expand_as(output)], dim=-1))
 
@@ -132,7 +185,7 @@ class CountLSTMv2(nn.Module):
         self.hidden_size = hidden_size
         self.max_count = max_count
         self.pos_embedding = nn.Embedding(max_count, hidden_size)
-        self.gru = nn.GRU(hidden_size, hidden_size)
+        self.gru = CompileSafeGRU(hidden_size, hidden_size)
         self.transformer = DownscaledTransformer(
             hidden_size,
             hidden_size=128,
@@ -155,8 +208,8 @@ class CountLSTMv2(nn.Module):
         pos_seq = self.pos_embedding(count_idx)  # (gold_count_val, D)
         pos_seq = pos_seq.unsqueeze(1).expand(-1, M, -1)  # (gold_count_val, M, D)
 
-        h0 = pc_emb.unsqueeze(0)  # (1, M, D)
-        output, _ = self.gru(pos_seq, h0)  # (gold_count_val, M, D)
+        # Compile-safe GRU forward.
+        output = self.gru(pos_seq, pc_emb)  # (gold_count_val, M, D)
 
         pc_broadcast = pc_emb.unsqueeze(0).expand_as(output)
         return self.transformer(output + pc_broadcast)
@@ -192,7 +245,7 @@ class CountLSTMoE(nn.Module):
 
         # ───── positional encoding + recurrent core ─────
         self.pos_embedding = nn.Embedding(max_count, hidden_size)
-        self.gru = nn.GRU(hidden_size, hidden_size)
+        self.gru = CompileSafeGRU(hidden_size, hidden_size)
 
         # ───── expert parameters (all packed in two tensors) ─────
         inner = hidden_size * ffn_mult
@@ -230,8 +283,8 @@ class CountLSTMoE(nn.Module):
         idx = torch.arange(L, device=pc_emb.device)
         pos_seq = self.pos_embedding(idx).unsqueeze(1).expand(L, M, D)
 
-        h0 = pc_emb.unsqueeze(0)  # [1, M, D]
-        h, _ = self.gru(pos_seq, h0)  # [L, M, D]
+        # Compile-safe GRU forward.
+        h = self.gru(pos_seq, pc_emb)  # [L, M, D]
 
         # ───── routing / gating ─────
         gates = self.router(h)  # [L, M, E]

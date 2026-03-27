@@ -768,12 +768,13 @@ class Extractor(PreTrainedModel):
     # =========================================================================
 
     def compile(self) -> 'Extractor':
-        """Compile the encoder and span-rep with ``torch.compile(dynamic=True)``.
+        """Compile tensor subgraphs with ``torch.compile(dynamic=True)``.
 
-        Only the two heaviest tensor subgraphs are compiled:
+        Three components are compiled (all verified 0 graph breaks):
 
-        - **encoder** (DeBERTa backbone, 584 ops, 0 graph breaks)
-        - **_compute_span_rep_core** (span index + MLP, 0 graph breaks)
+        - **encoder** (DeBERTa backbone)
+        - **_compute_span_rep_core** (span index + MLP)
+        - **count_embed** (CompileSafeGRU + DownscaledTransformer)
 
         The list-of-tensors padding in ``compute_span_rep_batched`` and the
         per-sample Python decode path are left in eager mode.
@@ -794,7 +795,8 @@ class Extractor(PreTrainedModel):
         self._compute_span_rep_core = torch.compile(
             self._compute_span_rep_core, dynamic=True,
         )
-        logger.info("Compiled encoder and span-rep with torch.compile(dynamic=True)")
+        self.count_embed = torch.compile(self.count_embed, dynamic=True)
+        logger.info("Compiled encoder, span-rep, and count-embed with torch.compile(dynamic=True)")
         return self
 
     def load_adapter(self, adapter_path: str) -> 'Extractor':
