@@ -5,6 +5,9 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 include = ["gliner2", "gliner2.*"]
 
+[tool.setuptools.package-data]
+gliner2 = ["py.typed"]
+
 [tool.setuptools.dynamic]
 version = {attr = "gliner2.__version__"}
 
