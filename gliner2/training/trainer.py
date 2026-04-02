@@ -934,6 +934,7 @@ class GLiNER2Trainer:
 
         self.progress_bar = tqdm(total=max_steps, desc="Training", disable=not self.is_main_process)
 
+        should_stop = False
         for epoch in range(num_epochs):
             self.epoch = epoch
 
@@ -1019,9 +1020,14 @@ class GLiNER2Trainer:
 
                     if self.config.eval_strategy == "steps" and self.global_step % self.config.eval_steps == 0:
                         if eval_dataset:
-                            self._evaluate(eval_dataset)
+                            prev_best = self.best_metric
+                            eval_metrics = self._evaluate(eval_dataset)
                             self.model.train()
                             self.processor.change_mode(is_training=True)
+                            if self.config.early_stopping and self._check_early_stopping(eval_metrics, prev_best):
+                                logger.info(f"Early stopping triggered at step {self.global_step}")
+                                should_stop = True
+                                break
                         self._save_checkpoint(f"checkpoint-{self.global_step}")
 
                     self.progress_bar.update(1)
@@ -1029,6 +1035,9 @@ class GLiNER2Trainer:
                     if self.global_step >= max_steps:
                         break
             
+            if should_stop:
+                break
+
             # Fix Bug #6: Flush incomplete gradient accumulation at end of epoch
             if epoch_steps % self.config.gradient_accumulation_steps != 0:
                 grad_norm = self._flush_gradients()
@@ -1041,10 +1050,11 @@ class GLiNER2Trainer:
 
             if self.config.eval_strategy == "epoch":
                 if eval_dataset:
+                    prev_best = self.best_metric
                     eval_metrics = self._evaluate(eval_dataset)
                     self.model.train()
                     self.processor.change_mode(is_training=True)
-                    if self.config.early_stopping and self._check_early_stopping(eval_metrics):
+                    if self.config.early_stopping and self._check_early_stopping(eval_metrics, prev_best):
                         logger.info(f"Early stopping triggered at epoch {epoch + 1}")
                         break
                 self._save_checkpoint(f"checkpoint-epoch-{epoch + 1}")
@@ -1147,12 +1157,13 @@ class GLiNER2Trainer:
 
         return metrics
 
-    def _check_early_stopping(self, metrics: Dict[str, float]) -> bool:
+    def _check_early_stopping(self, metrics: Dict[str, float], prev_best: Optional[float] = None) -> bool:
         metric_value = metrics.get(self.config.metric_for_best, metrics["eval_loss"])
+        compare_against = prev_best if prev_best is not None else self.best_metric
         if self.config.greater_is_better:
-            improved = metric_value > self.best_metric + self.config.early_stopping_threshold
+            improved = metric_value > compare_against + self.config.early_stopping_threshold
         else:
-            improved = metric_value < self.best_metric - self.config.early_stopping_threshold
+            improved = metric_value < compare_against - self.config.early_stopping_threshold
 
         if improved:
             self.patience_counter = 0
