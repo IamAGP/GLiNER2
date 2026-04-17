@@ -17,6 +17,8 @@
 
 GLiNER2 unifies **Named Entity Recognition**, **Text Classification**, **Structured Data Extraction**, and **Relation Extraction** into a single 205M parameter model. It provides efficient CPU-based inference without requiring complex pipelines or external API dependencies.
 
+Fine-tune via [Pioneer](https://pioneer.ai/gliner). Additional documentation via [Pioneer docs](https://agent.pioneer.ai/docs/api-reference). Join discussions on [Discord](https://discord.gg/fastino) and [Reddit](https://www.reddit.com/r/GLiNER/).
+
 ## ✨ Why GLiNER2?
 
 - **🎯 One Model, Four Tasks**: Entities, classification, structured data, and relations in a single forward pass
