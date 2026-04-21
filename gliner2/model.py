@@ -732,6 +732,16 @@ class Extractor(PreTrainedModel):
 
         model.load_state_dict(state_dict)
 
+        # Mirror HF PreTrainedModel.from_pretrained semantics so downstream
+        # PEFT saves derive ``base_model_name_or_path`` correctly. PEFT reads
+        # ``self.base_model.model.__dict__.get("name_or_path")`` when serialising
+        # an adapter; without an explicit instance attribute that lookup misses
+        # the ``PreTrainedModel.name_or_path`` property and writes "" into
+        # ``adapter_config.json``, which breaks downstream resolvers (e.g.
+        # vLLM's ``lora_filesystem_resolver``) that match on this field.
+        model.config._name_or_path = repo_or_dir
+        model.name_or_path = repo_or_dir
+
         if map_location is not None:
             model = model.to(map_location)
 
@@ -829,10 +839,19 @@ class Extractor(PreTrainedModel):
         from peft import LoraConfig as PeftLoraConfig, get_peft_model
         from gliner2.training.lora import _resolve_targets, _cast_lora_dtype
 
+        # Pin ``base_model_name_or_path`` up front so adapters saved via
+        # ``PeftModel.save_pretrained`` always carry a concrete identifier
+        # (matches what the base model was loaded from in ``from_pretrained``).
+        base_id = (
+            getattr(self, "name_or_path", "")
+            or getattr(self.config, "_name_or_path", "")
+            or None
+        )
         cfg = PeftLoraConfig(
             r=r, lora_alpha=alpha, lora_dropout=dropout,
             target_modules=_resolve_targets(self, targets or ["encoder"]),
             bias="none", use_dora=use_dora,
+            base_model_name_or_path=base_id,
         )
         peft_model = get_peft_model(self, cfg)
         _cast_lora_dtype(peft_model)
