@@ -10,11 +10,19 @@ version = {attr = "gliner2.__version__"}
 
 [project]
 name = "gliner2"
+description = "GLiNER2: Unified Schema-Based Information Extraction and Text Classification"
 readme = "README.md"
+license = "Apache-2.0"
 requires-python = ">=3.8"
 
 maintainers = [
     {name = "Urchade Zaratiana"},
+]
+
+classifiers = [
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
 ]
 
 dependencies = [
@@ -23,3 +31,7 @@ dependencies = [
 ]
 
 dynamic = ["version"]
+
+[project.urls]
+Homepage = "https://github.com/fastino-ai/GLiNER2"
+Repository = "https://github.com/fastino-ai/GLiNER2"
