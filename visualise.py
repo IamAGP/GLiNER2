@@ -42,17 +42,14 @@ C_COLD       = "#0a0a2e"
 C_HOT        = "#ffee00"
 
 
-def narration(text, scale=0.38, color=C_WHITE):
+def narration(text, color=C_WHITE):
     """Narration subtitle at the bottom of the scene."""
-    return Text(
-        text, font_size=18, color=color,
-        font="Helvetica"
-    ).scale(scale).to_edge(DOWN, buff=0.25)
+    return Text(text, font_size=22, color=color).to_edge(DOWN, buff=0.3)
 
 
 def section_title(text):
     """Small label top-left."""
-    return Text(text, font_size=20, color=C_DIM).to_corner(UL, buff=0.3)
+    return Text(text, font_size=24, color=C_DIM).to_corner(UL, buff=0.3)
 
 
 def val_to_color(v: float) -> ManimColor:
@@ -108,6 +105,7 @@ def get_model_data():
         "subwords":       subwords,
         "text_tokens":    d["text_tokens"],
         "field_names":    d["field_names"],
+        "schema_tokens":  d["schema_tokens"],   # exact token list the model built
         "p_emb_norm":     d["p_emb_norm"],
         "field_embs":     d["field_embs"].numpy(),       # (M, 768)
         "count_logits":   d["count_logits"].numpy(),     # (1, 20)
@@ -226,7 +224,8 @@ class TokenisationScene(Scene):
         n5 = narration("Special tokens [P], [E], [SEP] are added to encode the schema structure.")
         self.play(FadeIn(n5))
 
-        special_tokens = ["[P]", "investment", "[E]", "amount", "[E]", "company", "[SEP]"]
+        # pulled directly from the model — no hardcoding
+        special_tokens = data["schema_tokens"]
         special_boxes = VGroup()
         for st in special_tokens:
             is_special = st.startswith("[")

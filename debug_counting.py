@@ -85,6 +85,7 @@ class DebugGLiNER2(GLiNER2):
 
         _schema_debug[schema_name] = {
             "field_names":    field_names,
+            "schema_tokens":  schema_tokens,        # full token list as model built it
             "text_tokens":    text_tokens,
             "text_len":       text_len,
             "start_mapping":  start_mapping,
