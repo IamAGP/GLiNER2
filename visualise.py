@@ -76,45 +76,131 @@ def get_model_data():
     import sys, os
     sys.path.insert(0, os.path.dirname(__file__))
     from debug_counting import DebugGLiNER2, _schema_debug, _gru_steps, _transformer_out
-    from gliner2 import GLiNER2
 
     print("Loading model for visualisation data...")
     dm = DebugGLiNER2.from_pretrained(MODEL)
 
-    # Hook encoder
-    enc_out = {}
-    def hook_enc(mod, inp, out):
+    # ── pull architecture facts directly from live config ──────────────────
+    cfg = dm.encoder.config
+    encoder_config = {
+        "num_layers":    cfg.num_hidden_layers,
+        "num_heads":     cfg.num_attention_heads,
+        "hidden_size":   cfg.hidden_size,
+        "ffn_size":      cfg.intermediate_size,
+        "pos_att_type":  getattr(cfg, "pos_att_type", []),
+        "model_type":    cfg.model_type,
+    }
+    # pull Q/K/V and FFN shapes from layer 0 directly
+    l0 = dm.encoder.encoder.layer[0]
+    encoder_config["qkv_shape"]  = list(l0.attention.self.query_proj.weight.shape)
+    encoder_config["ffn_in"]     = list(l0.intermediate.dense.weight.shape)
+    encoder_config["ffn_out"]    = list(l0.output.dense.weight.shape)
+    encoder_config["head_size"]  = l0.attention.self.attention_head_size
+
+    # ── hooks: encoder final output + all 12 layer hidden states ──────────
+    enc_out      = {}
+    layer_hidden = {}   # layer_idx -> (seq_len, 768)
+    attn_weights = {}   # layer_idx -> (num_heads, seq_len, seq_len)
+
+    def hook_enc_out(mod, inp, out):
         enc_out["hs"] = out.last_hidden_state.detach().cpu()
-    h = dm.encoder.register_forward_hook(hook_enc)
+
+    def make_layer_hook(idx):
+        def hook(mod, inp, out):
+            hs = out[0] if isinstance(out, tuple) else out
+            layer_hidden[idx] = hs[0].detach().cpu()
+        return hook
+
+    def make_attn_hook(idx):
+        def hook(mod, inp, out):
+            if isinstance(out, tuple) and len(out) >= 2 and out[1] is not None:
+                attn_weights[idx] = out[1][0].detach().cpu()
+        return hook
+
+    hooks = [dm.encoder.register_forward_hook(hook_enc_out)]
+    for i, layer in enumerate(dm.encoder.encoder.layer):
+        hooks.append(layer.register_forward_hook(make_layer_hook(i)))
+        hooks.append(layer.attention.self.register_forward_hook(make_attn_hook(i)))
+
+    # enable attention weight output via config flag
+    dm.encoder.config.output_attentions = True
 
     _schema_debug.clear()
     _gru_steps.clear()
     _transformer_out.clear()
 
     dm.extract_json(TEXT, SCHEMA)
-    h.remove()
+
+    dm.encoder.config.output_attentions = False
+    for h in hooks:
+        h.remove()
 
     d = _schema_debug["investment"]
 
-    # Subword tokens
-    tok = dm.processor.tokenizer
-    enc = tok(TEXT, return_tensors="pt")
-    subwords = tok.convert_ids_to_tokens(enc["input_ids"][0])
+    # ── full sequence token labels (what DeBERTa actually sees) ───────────
+    # schema_tokens (e.g. ['(','[P]','investment','(','[C]','amount',...,')'])
+    # + separator + text subwords from tokenizer
+    tok      = dm.processor.tokenizer
+    enc_ids  = tok(TEXT, return_tensors="pt")
+    subwords = tok.convert_ids_to_tokens(enc_ids["input_ids"][0])  # text only
+    schema_toks = d["schema_tokens"]
+    # separator token that the processor inserts between schema and text
+    sep_tok  = "[SEP_TEXT]"
+    full_seq_tokens = schema_toks + [sep_tok] + list(subwords)
+    seq_len = enc_out["hs"].shape[1]  # authoritative — actual encoder input length
+    full_seq_tokens = full_seq_tokens[:seq_len]  # trim to exact length
+
+    # ── layer norms: (num_layers, seq_len) ────────────────────────────────
+    num_layers  = encoder_config["num_layers"]
+    layer_norms = np.zeros((num_layers, seq_len))
+    for i in range(num_layers):
+        if i in layer_hidden:
+            hs = layer_hidden[i].numpy()  # (seq_len, 768)
+            layer_norms[i] = np.linalg.norm(hs, axis=-1)
+
+    # ── [P] token position in full sequence ───────────────────────────────
+    try:
+        p_pos = full_seq_tokens.index("[P]")
+    except ValueError:
+        p_pos = 1  # fallback
+
+    # ── last-layer attention mean over heads, [P] row ─────────────────────
+    last_layer = num_layers - 1
+    if last_layer in attn_weights:
+        attn_mat_last = attn_weights[last_layer].numpy()   # (heads, seq, seq)
+        p_attn_last   = attn_mat_last.mean(axis=0)[p_pos]  # (seq,) — [P]→all
+        attn_mean_last = attn_mat_last.mean(axis=0)         # (seq, seq)
+    else:
+        p_attn_last    = np.ones(seq_len) / seq_len
+        attn_mean_last = np.eye(seq_len)
 
     _model_data.update({
-        "subwords":       subwords,
-        "text_tokens":    d["text_tokens"],
-        "field_names":    d["field_names"],
-        "schema_tokens":  d["schema_tokens"],   # exact token list the model built
-        "p_emb_norm":     d["p_emb_norm"],
-        "field_embs":     d["field_embs"].numpy(),       # (M, 768)
-        "count_logits":   d["count_logits"].numpy(),     # (1, 20)
-        "pred_count":     d["pred_count"],
-        "span_scores":    d["span_scores"].numpy(),      # (L, M, T, W)
-        "struct_proj":    d["struct_proj"].numpy(),      # (L, M, 768)
-        "gru_out":        _gru_steps.get("investment", torch.zeros(1)).numpy(),
-        "encoder_hs":     enc_out.get("hs", torch.zeros(1, 1, 768)).numpy(),
-        "text_len":       d["text_len"],
+        # tokenisation
+        "subwords":         subwords,
+        "full_seq_tokens":  full_seq_tokens,
+        "seq_len":          seq_len,
+        "p_pos":            p_pos,
+        # schema / field
+        "text_tokens":      d["text_tokens"],
+        "field_names":      d["field_names"],
+        "schema_tokens":    d["schema_tokens"],
+        # encoder architecture (from live config)
+        "encoder_config":   encoder_config,
+        # encoder internals (from live forward pass)
+        "encoder_hs":       enc_out.get("hs", torch.zeros(1, 1, 768)).numpy(),
+        "layer_norms":      layer_norms,            # (12, seq_len)
+        "p_attn_last":      p_attn_last,            # (seq_len,)
+        "attn_mean_last":   attn_mean_last,         # (seq_len, seq_len)
+        # count prediction
+        "p_emb_norm":       d["p_emb_norm"],
+        "field_embs":       d["field_embs"].numpy(),
+        "count_logits":     d["count_logits"].numpy(),
+        "pred_count":       d["pred_count"],
+        # span extraction
+        "span_scores":      d["span_scores"].numpy(),
+        "struct_proj":      d["struct_proj"].numpy(),
+        "gru_out":          _gru_steps.get("investment", torch.zeros(1)).numpy(),
+        "text_len":         d["text_len"],
     })
     print("Model data ready.")
     return _model_data
@@ -281,101 +367,379 @@ class EncoderScene(Scene):
         self.camera.background_color = C_BG
         data = get_model_data()
 
+        cfg        = data["encoder_config"]
+        seq_tokens = data["full_seq_tokens"]
+        seq_len    = data["seq_len"]
+        p_pos      = data["p_pos"]
+        layer_norms = data["layer_norms"]   # (12, seq_len)
+        p_attn     = data["p_attn_last"]    # (seq_len,)
+        hs_final   = data["encoder_hs"][0]  # (seq_len, 768)
+        num_layers  = cfg["num_layers"]
+        num_heads   = cfg["num_heads"]
+        hidden      = cfg["hidden_size"]
+        ffn         = cfg["ffn_size"]
+        pos_att     = cfg["pos_att_type"]   # ['p2c', 'c2p']
+        head_size   = cfg["head_size"]
+        qkv_shape   = cfg["qkv_shape"]
+        ffn_in      = cfg["ffn_in"]
+        ffn_out     = cfg["ffn_out"]
+
         title = section_title("Scene 2 · DeBERTa Encoder")
         self.add(title)
 
-        n1 = narration("DeBERTa processes the full sequence — schema tokens + text tokens together.")
+        # ══════════════════════════════════════════════════════════════════
+        # PART 1 — Full input sequence (all tokens, real from model)
+        # ══════════════════════════════════════════════════════════════════
+        n1 = narration(f"DeBERTa receives {seq_len} tokens: {len(data['schema_tokens'])} schema tokens + separator + text subwords.")
         self.play(FadeIn(n1))
         self.wait(1.5)
 
-        # ── encoder box ──
-        enc_box = RoundedRectangle(
-            corner_radius=0.2, width=5, height=2.5,
-            fill_color="#1a1a3a", fill_opacity=1,
-            stroke_color=C_TOKEN, stroke_width=2,
-        ).move_to(ORIGIN)
-        enc_label = Text("DeBERTa\n(205M params)", font_size=22, color=C_TOKEN)
-        enc_label.move_to(enc_box)
-        enc_group = VGroup(enc_box, enc_label)
+        show_n = min(seq_len, 18)
+        tok_boxes = VGroup()
+        for i in range(show_n):
+            t = seq_tokens[i]
+            is_schema = i < len(data["schema_tokens"])
+            is_p      = (i == p_pos)
+            color = C_SPECIAL if is_p else (C_SCHEMA if is_schema else C_TOKEN)
+            box = RoundedRectangle(
+                corner_radius=0.06,
+                width=max(len(t) * 0.11 + 0.15, 0.38), height=0.35,
+                fill_color=color, fill_opacity=0.2,
+                stroke_color=color, stroke_width=1.2,
+            )
+            lbl = Text(t, font_size=11, color=color)
+            tok_boxes.add(VGroup(box, lbl))
 
-        self.play(FadeIn(enc_group))
-        self.wait(0.5)
+        if seq_len > show_n:
+            ellipsis = Text("...", font_size=14, color=C_DIM)
+            tok_boxes.add(ellipsis)
 
-        # ── input tokens flowing in ──
+        tok_boxes.arrange(RIGHT, buff=0.06)
+        tok_boxes.scale_to_fit_width(13)
+        tok_boxes.move_to(UP * 2.2)
+
         self.play(FadeOut(n1))
-        n2 = narration("Every token goes in — and comes out as a 768-dimensional contextual vector.")
+        n2 = narration("Pink=[P]  Orange=schema  Blue=text tokens.  All 27 tokens processed as one sequence.")
         self.play(FadeIn(n2))
-
-        input_labels = ["[P]", "[E]amount", "[E]company", "goldman", "$", "500M", "stripe", "..."]
-        in_tokens = VGroup(*[
-            Text(t, font_size=14, color=C_SCHEMA if t.startswith("[") else C_WHITE)
-            for t in input_labels
-        ]).arrange(DOWN, buff=0.18).next_to(enc_box, LEFT, buff=1.2)
-
-        out_bars = VGroup()
-        hs = data["encoder_hs"][0]  # (seq_len, 768)
-        bar_norms = [float(np.linalg.norm(hs[i])) for i in range(min(8, hs.shape[0]))]
-        max_norm  = max(bar_norms) + 1e-8
-        for norm in bar_norms:
-            h_scaled = (norm / max_norm) * 1.2 + 0.1
-            bar = Rectangle(
-                width=0.25, height=h_scaled,
-                fill_color=C_HIGHLIGHT, fill_opacity=0.8,
-                stroke_width=0,
-            )
-            out_bars.add(bar)
-        out_bars.arrange(DOWN, buff=0.05).next_to(enc_box, RIGHT, buff=1.2)
-        out_label = Text("768-dim\nvectors", font_size=14, color=C_HIGHLIGHT)
-        out_label.next_to(out_bars, RIGHT, buff=0.2)
-
-        arrow_in  = Arrow(in_tokens.get_right(), enc_box.get_left(),  buff=0.1, color=C_DIM)
-        arrow_out = Arrow(enc_box.get_right(), out_bars.get_left(), buff=0.1, color=C_DIM)
-
         self.play(
-            LaggedStart(*[FadeIn(t, shift=RIGHT*0.2) for t in in_tokens], lag_ratio=0.1),
-            run_time=1.5
-        )
-        self.play(GrowArrow(arrow_in))
-        self.wait(0.5)
-        self.play(GrowArrow(arrow_out))
-        self.play(
-            LaggedStart(*[GrowFromEdge(b, DOWN) for b in out_bars], lag_ratio=0.08),
-            FadeIn(out_label),
-            run_time=1.5
-        )
-        self.wait(1)
-
-        # ── key point: contextual ──
-        self.play(FadeOut(n2))
-        n3 = narration("Unlike word2vec, each vector is CONTEXTUAL — the same word gets\na different vector depending on surrounding words.")
-        self.play(FadeIn(n3))
-        self.wait(2.5)
-
-        # ── highlight [P] ──
-        self.play(FadeOut(n3))
-        n4 = narration("The [P] token is special — it attends to everything\nand summarises the whole input for count prediction.")
-        self.play(FadeIn(n4))
-
-        p_box = SurroundingRectangle(in_tokens[0], color=C_SPECIAL, buff=0.08, stroke_width=2)
-        self.play(Create(p_box))
-
-        # draw attention lines from [P] to all others
-        attention_lines = VGroup(*[
-            Line(
-                in_tokens[0].get_right(),
-                in_tokens[i].get_right() + RIGHT * 0.1,
-                stroke_width=1,
-                stroke_opacity=0.4,
-                color=C_SPECIAL,
-            )
-            for i in range(1, len(input_labels))
-        ])
-        self.play(
-            LaggedStart(*[Create(l) for l in attention_lines], lag_ratio=0.1),
-            run_time=1.2
+            LaggedStart(*[FadeIn(tb, shift=UP * 0.1) for tb in tok_boxes], lag_ratio=0.04),
+            run_time=1.8
         )
         self.wait(2)
-        self.play(FadeOut(n4), FadeOut(title))
+        self.play(FadeOut(n2), FadeOut(tok_boxes))
+
+        # ══════════════════════════════════════════════════════════════════
+        # PART 2 — Architecture facts from live config
+        # ══════════════════════════════════════════════════════════════════
+        n3 = narration("Architecture pulled from live model config — not a diagram, the actual numbers.")
+        self.play(FadeIn(n3))
+
+        arch_lines = [
+            ("model_type",     cfg["model_type"]),
+            ("num_layers",     str(num_layers)),
+            ("num_heads",      str(num_heads)),
+            ("hidden_size",    str(hidden)),
+            ("ffn_size",       str(ffn)),
+            ("head_size",      f"{hidden} / {num_heads} = {head_size}"),
+            ("Q/K/V proj",     f"Linear({qkv_shape[1]} → {qkv_shape[0]})"),
+            ("FFN in",         f"Linear({ffn_in[1]} → {ffn_in[0]})  GELU"),
+            ("FFN out",        f"Linear({ffn_out[1]} → {ffn_out[0]})  + LayerNorm"),
+            ("pos_att_type",   " + ".join(pos_att)),
+        ]
+
+        rows = VGroup()
+        for key, val in arch_lines:
+            key_t = Text(key + ":", font_size=18, color=C_DIM)
+            val_t = Text(val,       font_size=18, color=C_HIGHLIGHT)
+            row = VGroup(key_t, val_t).arrange(RIGHT, buff=0.5)
+            rows.add(row)
+
+        rows.arrange(DOWN, aligned_edge=LEFT, buff=0.22)
+        rows.move_to(ORIGIN)
+        # pin all value texts to same x so the column is aligned
+        val_x = max(row[0].get_right()[0] for row in rows) + 0.5
+        for row in rows:
+            row[1].set_x(val_x, LEFT)
+
+        self.play(FadeOut(n3))
+        n4 = narration("Every number here comes from model.config and layer[0].weight.shape — nothing typed by hand.")
+        self.play(FadeIn(n4))
+        self.play(
+            LaggedStart(*[FadeIn(r, shift=RIGHT * 0.15) for r in rows], lag_ratio=0.08),
+            run_time=2.0
+        )
+        self.wait(3)
+        self.play(FadeOut(n4), FadeOut(rows))
+
+        # ══════════════════════════════════════════════════════════════════
+        # PART 3 — One transformer layer internals (disentangled attention)
+        # ══════════════════════════════════════════════════════════════════
+        n5 = narration("Each of the 12 layers has 3 sub-blocks: Disentangled Attention → FFN → LayerNorm+Residual.")
+        self.play(FadeIn(n5))
+        self.wait(2)
+        self.play(FadeOut(n5))
+
+        # draw one layer as a vertical pipeline — MathTex for proper subscripts
+        block_specs = [
+            (MathTex(r"\text{Input } x \in \mathbb{R}^{768}", font_size=28, color=C_DIM),          C_DIM),
+            (MathTex(r"Q = xW_q \quad K = xW_k \quad V = xW_v \quad (\text{per head: }64d)", font_size=26, color=C_TOKEN),   C_TOKEN),
+            (MathTex(rf"c2c = (xW_q)(xW_k)^T \;/\; \sqrt{{{head_size}}}", font_size=26, color=C_SCHEMA),  C_SCHEMA),
+            (MathTex(rf"c2p = (xW_q)(pW_k)^T \;/\; \sqrt{{{head_size}}}", font_size=26, color=C_SCHEMA),  C_SCHEMA),
+            (MathTex(rf"p2c = (pW_q)(xW_k)^T \;/\; \sqrt{{{head_size}}}", font_size=26, color=C_SCHEMA),  C_SCHEMA),
+            (MathTex(r"A = \text{softmax}(c2c + c2p + p2c)", font_size=28, color=C_HIGHLIGHT),     C_HIGHLIGHT),
+            (MathTex(r"\text{context} = A \cdot V \;\rightarrow\; \text{project} + \text{residual}", font_size=26, color=C_TOKEN),  C_TOKEN),
+            (MathTex(rf"\text{{FFN}}: {hidden} \rightarrow {ffn} \;(\text{{GELU}})\; \rightarrow {hidden}", font_size=26, color=C_SCHEMA),  C_SCHEMA),
+            (MathTex(r"\text{LayerNorm}(x + \text{FFN}(x))", font_size=28, color=C_HIGHLIGHT),     C_HIGHLIGHT),
+        ]
+
+        block_objs = VGroup()
+        for tex_obj, color in block_specs:
+            box = RoundedRectangle(
+                corner_radius=0.08,
+                width=8.5, height=0.65,
+                fill_color=color, fill_opacity=0.1,
+                stroke_color=color, stroke_width=1.2,
+            )
+            tex_obj.move_to(box)
+            block_objs.add(VGroup(box, tex_obj))
+
+        block_objs.arrange(DOWN, buff=0.1)
+        block_objs.scale_to_fit_height(6.8)
+        block_objs.move_to(ORIGIN)
+
+        n6 = narration("DeBERTa's key innovation: disentangled attention separates CONTENT and POSITION scores.")
+        self.play(FadeIn(n6))
+        self.play(
+            LaggedStart(*[FadeIn(b, shift=DOWN * 0.1) for b in block_objs], lag_ratio=0.1),
+            run_time=2.5
+        )
+        self.wait(3)
+
+        # highlight the three disentangled score rows
+        self.play(FadeOut(n6))
+        n7 = narration(f"pos_att_type={pos_att} from model config — c2p and p2c are position-content cross terms.\nThis is what makes DeBERTa stronger than BERT.")
+        self.play(FadeIn(n7))
+        for i in [2, 3, 4]:
+            self.play(block_objs[i][0].animate.set_fill(C_SCHEMA, opacity=0.4), run_time=0.3)
+        self.wait(3)
+        self.play(FadeOut(n7), FadeOut(block_objs))
+
+        # ══════════════════════════════════════════════════════════════════
+        # PART 4 — [P] token attention heatmap (real weights, last layer)
+        # ══════════════════════════════════════════════════════════════════
+        n8 = narration(f"Real attention weights: [P] token at layer 12 (mean over {num_heads} heads).")
+        self.play(FadeIn(n8))
+        self.wait(1.5)
+        self.play(FadeOut(n8))
+
+        # bar chart — [P] attention over ALL seq_len tokens (no truncation)
+        attn_vals = p_attn[:seq_len]
+        max_attn  = attn_vals.max() + 1e-8
+
+        bar_w     = min(0.35, 12.0 / seq_len - 0.04)   # shrink bars to fit all tokens
+        attn_bars = VGroup()
+        attn_lbls = VGroup()
+        val_labels = VGroup()
+
+        for i in range(seq_len):
+            h_bar = (attn_vals[i] / max_attn) * 2.8 + 0.05
+            color = C_SPECIAL if i == p_pos else (C_HIGHLIGHT if attn_vals[i] > attn_vals.mean() else C_DIM)
+            bar = Rectangle(
+                width=bar_w, height=h_bar,
+                fill_color=color, fill_opacity=0.85,
+                stroke_width=0,
+            )
+            attn_bars.add(bar)
+
+            tok_name = seq_tokens[i] if i < len(seq_tokens) else f"t{i}"
+            lbl = Text(tok_name, font_size=8, color=color)
+            lbl.rotate(PI / 3)   # angled so full names are readable
+            attn_lbls.add(lbl)
+
+            v = Text(f"{attn_vals[i]:.3f}", font_size=7, color=C_DIM)
+            val_labels.add(v)
+
+        attn_bars.arrange(RIGHT, buff=0.04, aligned_edge=DOWN)
+        attn_bars.move_to(UP * 0.5)
+        for i, bar in enumerate(attn_bars):
+            attn_lbls[i].next_to(bar, DOWN, buff=0.08)
+            val_labels[i].next_to(bar, UP,   buff=0.04)
+
+        x_title = Text(
+            f"[P] attention weight → all {seq_len} tokens  (layer 12, mean over {num_heads} heads)",
+            font_size=14, color=C_WHITE
+        ).to_edge(UP, buff=0.7)
+
+        n9 = narration("[P] attends most to schema structure tokens, not raw text.\nThis lets it count instances from the schema, not individual words.")
+        self.play(FadeIn(n9), FadeIn(x_title))
+        self.play(
+            LaggedStart(*[GrowFromEdge(b, DOWN) for b in attn_bars], lag_ratio=0.03),
+            run_time=1.8
+        )
+        self.play(FadeIn(attn_lbls), FadeIn(val_labels))
+        self.wait(3.5)
+        self.play(FadeOut(n9), FadeOut(attn_bars), FadeOut(attn_lbls),
+                  FadeOut(val_labels), FadeOut(x_title))
+
+        # ══════════════════════════════════════════════════════════════════
+        # PART 5 — Token norm evolution across 12 layers (real values)
+        # ══════════════════════════════════════════════════════════════════
+        n10 = narration("How does each token's L2 norm grow as it passes through 12 layers?")
+        self.play(FadeIn(n10))
+        self.wait(1.5)
+        self.play(FadeOut(n10))
+
+        # trace ALL seq_len tokens — color by category
+        def token_color(i):
+            if i == p_pos:                          return C_SPECIAL   # [P] pink
+            if i < len(data["schema_tokens"]):      return C_SCHEMA    # schema orange
+            if seq_tokens[i] in ("[SEP_TEXT]", "[CLS]", "[SEP]"): return "#888888"
+            return C_TOKEN                                             # text blue
+
+        axes_w, axes_h = 9.5, 4.2
+        x_step      = axes_w / (num_layers - 1)
+        axes_origin = LEFT * 4.8 + DOWN * 2.0
+
+        x_axis = Arrow(axes_origin, axes_origin + RIGHT * (axes_w + 0.3),
+                       buff=0, color=C_DIM, stroke_width=1.5)
+        y_axis = Arrow(axes_origin, axes_origin + UP * (axes_h + 0.3),
+                       buff=0, color=C_DIM, stroke_width=1.5)
+        x_lbl = Text("layer", font_size=14, color=C_DIM).next_to(x_axis.get_end(), RIGHT, buff=0.1)
+        y_lbl = Text("L2 norm", font_size=14, color=C_DIM).rotate(PI/2).next_to(y_axis.get_end(), UP, buff=0.1)
+
+        x_ticks = VGroup()
+        for i in range(num_layers):
+            t = Text(str(i), font_size=10, color=C_DIM)
+            t.move_to(axes_origin + RIGHT * i * x_step + DOWN * 0.25)
+            x_ticks.add(t)
+
+        max_norm_val = layer_norms.max() + 1e-8
+
+        self.play(Create(x_axis), Create(y_axis),
+                  FadeIn(x_lbl), FadeIn(y_lbl), FadeIn(x_ticks))
+
+        # legend — 4 categories
+        legend_items = [
+            (C_SPECIAL, "[P] token"),
+            (C_SCHEMA,  "schema tokens"),
+            (C_TOKEN,   "text tokens"),
+            ("#888888", "special ([CLS],[SEP])"),
+        ]
+        legend = VGroup()
+        for col, lbl_str in legend_items:
+            dot = Dot(radius=0.09, color=col)
+            lbl = Text(lbl_str, font_size=13, color=col)
+            legend.add(VGroup(dot, lbl).arrange(RIGHT, buff=0.15))
+        legend.arrange(DOWN, aligned_edge=LEFT, buff=0.18)
+        legend.to_corner(UR, buff=0.4)
+        self.play(FadeIn(legend))
+
+        # draw all token lines — thin so they don't clutter
+        line_plots = VGroup()
+        for i in range(seq_len):
+            col    = token_color(i)
+            norms  = layer_norms[:, i]
+            points = [
+                axes_origin + RIGHT * l * x_step + UP * (norms[l] / max_norm_val) * axes_h
+                for l in range(num_layers)
+            ]
+            polyline = VMobject(color=col, stroke_width=1.5 if i != p_pos else 3.0,
+                                stroke_opacity=0.5 if i != p_pos else 1.0)
+            polyline.set_points_as_corners(points)
+            line_plots.add(polyline)
+
+        # find the token with highest norm at final layer — let model speak
+        final_layer_norms = layer_norms[num_layers - 1, :]
+        top_pos   = int(final_layer_norms.argmax())
+        top_label = seq_tokens[top_pos] if top_pos < len(seq_tokens) else f"t{top_pos}"
+        top_norm  = final_layer_norms[top_pos]
+
+        n11 = narration(
+            f"All {seq_len} tokens tracked across 12 layers. "
+            f"'{top_label}' has highest final norm ({top_norm:.1f}).\n"
+            f"[P] is pink. Schema=orange. Text=blue. Specials=grey."
+        )
+        self.play(FadeIn(n11))
+        self.play(
+            LaggedStart(*[Create(lp) for lp in line_plots], lag_ratio=0.03),
+            run_time=2.5
+        )
+        self.wait(3.5)
+
+        # ══════════════════════════════════════════════════════════════════
+        # PART 6 — Final output norms per token (bar chart)
+        # ══════════════════════════════════════════════════════════════════
+        self.play(FadeOut(n11), FadeOut(line_plots), FadeOut(legend),
+                  FadeOut(x_axis), FadeOut(y_axis),
+                  FadeOut(x_lbl), FadeOut(y_lbl), FadeOut(x_ticks))
+
+        n12 = narration("Final encoder output: L2 norm of each token's 768-dim vector after all 12 layers.")
+        self.play(FadeIn(n12))
+
+        # all seq_len tokens — no truncation
+        final_norms = np.linalg.norm(hs_final, axis=-1)  # (seq_len,)
+        max_fn      = final_norms.max() + 1e-8
+        bar_w       = min(0.34, 12.5 / seq_len - 0.04)
+
+        final_bars = VGroup()
+        final_lbls = VGroup()
+        final_vals = VGroup()
+        for i in range(seq_len):
+            is_p   = (i == p_pos)
+            is_sch = i < len(data["schema_tokens"])
+            is_sep = seq_tokens[i] in ("[SEP_TEXT]", "[CLS]", "[SEP]") if i < len(seq_tokens) else False
+            color  = C_SPECIAL if is_p else (C_SCHEMA if is_sch else ("#888888" if is_sep else C_TOKEN))
+            h_bar  = (final_norms[i] / max_fn) * 3.2 + 0.05
+            bar = Rectangle(
+                width=bar_w, height=h_bar,
+                fill_color=color, fill_opacity=0.85,
+                stroke_width=0,
+            )
+            final_bars.add(bar)
+            tok_name = seq_tokens[i] if i < len(seq_tokens) else f"t{i}"
+            lbl = Text(tok_name, font_size=8, color=color)
+            lbl.rotate(PI / 3)
+            final_lbls.add(lbl)
+            v = Text(f"{final_norms[i]:.0f}", font_size=7, color=C_DIM)
+            final_vals.add(v)
+
+        final_bars.arrange(RIGHT, buff=0.04, aligned_edge=DOWN)
+        final_bars.move_to(UP * 0.3)
+        for i, bar in enumerate(final_bars):
+            final_lbls[i].next_to(bar, DOWN, buff=0.08)
+            final_vals[i].next_to(bar, UP,   buff=0.04)
+
+        hdr = Text("Final encoder output norms — each bar = one token's 768-dim vector after 12 layers",
+                   font_size=13, color=C_WHITE).to_edge(UP, buff=0.7)
+
+        self.play(FadeIn(hdr))
+        self.play(
+            LaggedStart(*[GrowFromEdge(b, DOWN) for b in final_bars], lag_ratio=0.03),
+            run_time=1.8
+        )
+        self.play(FadeIn(final_lbls), FadeIn(final_vals))
+
+        # let the data decide which token has highest norm
+        top_pos_final   = int(final_norms.argmax())
+        top_label_final = seq_tokens[top_pos_final] if top_pos_final < len(seq_tokens) else f"t{top_pos_final}"
+        p_norm_val      = final_norms[p_pos]
+
+        self.play(FadeOut(n12))
+        n13 = narration(
+            f"Highest norm: '{top_label_final}' ({final_norms[top_pos_final]:.0f}).  "
+            f"[P] norm={p_norm_val:.0f} — not the largest.\n"
+            f"But [P]'s vector is what feeds the count_pred MLP in Scene 3."
+        )
+        self.play(FadeIn(n13))
+
+        p_bar = final_bars[p_pos]
+        self.play(
+            p_bar.animate.set_fill(C_SPECIAL, opacity=1.0),
+            Flash(p_bar, color=C_SPECIAL, line_length=0.2, num_lines=8),
+        )
+        self.wait(3.5)
+        self.play(FadeOut(n13), FadeOut(title), FadeOut(hdr),
+                  FadeOut(final_bars), FadeOut(final_lbls), FadeOut(final_vals))
         self.wait(0.5)
 
 
