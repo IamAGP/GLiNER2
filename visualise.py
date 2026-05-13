@@ -750,100 +750,159 @@ class EncoderScene(Scene):
 class CountPredScene(Scene):
     def construct(self):
         self.camera.background_color = C_BG
-        data = get_model_data()
+        data   = get_model_data()
+        logits = data["count_logits"][0]   # (20,) — raw from model
+        pred   = data["pred_count"]
+        p_norm = data["p_emb_norm"]
 
         title = section_title("Scene 3 · Count Prediction")
         self.add(title)
 
-        n1 = narration("Before extracting spans, the model asks: how many instances are in this text?")
+        # ══════════════════════════════════════════════════════════════════
+        # PART 1 — MLP architecture from live model
+        # ══════════════════════════════════════════════════════════════════
+        n1 = narration("[P]'s 768-dim vector goes into count_pred — a 2-layer MLP — to predict how many instances exist.")
         self.play(FadeIn(n1))
         self.wait(2)
-
-        # ── [P] vector → MLP → 20 bars ──
         self.play(FadeOut(n1))
-        n2 = narration("The [P] token vector flows into a small MLP that outputs 20 scores,\none for each possible count (0 to 19).")
+
+        # draw [P] → Linear(768→1536) → ReLU → Linear(1536→20) pipeline
+        stages = [
+            ("[P] vector\n768-dim",          C_SPECIAL,   1.4, 0.8),
+            ("Linear\n768 → 1536\n+ bias",   C_TOKEN,     2.0, 1.2),
+            ("ReLU",                          C_SCHEMA,    1.0, 0.7),
+            ("Linear\n1536 → 20\n+ bias",    C_TOKEN,     2.0, 1.2),
+            ("20 logits\n(counts 0–19)",      C_HIGHLIGHT, 1.6, 0.8),
+        ]
+        stage_objs = VGroup()
+        for label, color, w, h in stages:
+            box = RoundedRectangle(
+                corner_radius=0.1, width=w, height=h,
+                fill_color=color, fill_opacity=0.15,
+                stroke_color=color, stroke_width=1.5,
+            )
+            lbl = Text(label, font_size=14, color=color)
+            lbl.move_to(box)
+            stage_objs.add(VGroup(box, lbl))
+
+        stage_objs.arrange(RIGHT, buff=0.5)
+        stage_objs.move_to(UP * 0.5)
+
+        arrows = VGroup()
+        for i in range(len(stage_objs) - 1):
+            a = Arrow(
+                stage_objs[i].get_right(),
+                stage_objs[i+1].get_left(),
+                buff=0.05, color=C_DIM, stroke_width=1.5
+            )
+            arrows.add(a)
+
+        # dimension labels on arrows
+        dim_labels = ["768", "1536", "1536", "20"]
+        dim_label_objs = VGroup()
+        for i, (arrow, dim) in enumerate(zip(arrows, dim_labels)):
+            d = Text(dim, font_size=11, color=C_DIM)
+            d.next_to(arrow, UP, buff=0.08)
+            dim_label_objs.add(d)
+
+        n2 = narration("Architecture from live model: Sequential(Linear(768→1536), ReLU, Linear(1536→20)).")
         self.play(FadeIn(n2))
+        self.play(
+            LaggedStart(*[FadeIn(s, shift=RIGHT*0.1) for s in stage_objs], lag_ratio=0.15),
+            run_time=1.5
+        )
+        self.play(
+            LaggedStart(*[GrowArrow(a) for a in arrows], lag_ratio=0.1),
+            FadeIn(dim_label_objs),
+        )
+        self.wait(2.5)
+        self.play(FadeOut(n2), FadeOut(stage_objs), FadeOut(arrows), FadeOut(dim_label_objs))
 
-        p_vec = RoundedRectangle(
-            corner_radius=0.1, width=1.2, height=0.5,
-            fill_color=C_SPECIAL, fill_opacity=0.4,
-            stroke_color=C_SPECIAL, stroke_width=1.5,
-        ).move_to(LEFT * 4 + UP * 0.5)
-        p_label = Text("[P] vector\n768-dim", font_size=14, color=C_SPECIAL)
-        p_label.move_to(p_vec)
+        # ══════════════════════════════════════════════════════════════════
+        # PART 2 — Raw logits bar chart (all 20, real values)
+        # ══════════════════════════════════════════════════════════════════
+        n3 = narration("Softmax probabilities are useless here — count=2 gets p=1.0, all others p≈0.\nRaw logits tell the real story.")
+        self.play(FadeIn(n3))
+        self.wait(2.5)
+        self.play(FadeOut(n3))
 
-        mlp_box = RoundedRectangle(
-            corner_radius=0.15, width=2, height=1.2,
-            fill_color="#1a1a2e", fill_opacity=1,
-            stroke_color=C_TOKEN, stroke_width=1.5,
-        ).move_to(LEFT * 1 + UP * 0.5)
-        mlp_label = Text("count_pred\nMLP", font_size=16, color=C_TOKEN)
-        mlp_label.move_to(mlp_box)
+        # shift logits so min=0 for display (preserves relative differences)
+        logits_shifted = logits - logits.min()   # all >= 0
+        max_l = logits_shifted.max() + 1e-8
 
-        arrow1 = Arrow(p_vec.get_right(), mlp_box.get_left(), buff=0.1, color=C_DIM)
-
-        self.play(FadeIn(p_vec), FadeIn(p_label))
-        self.play(GrowArrow(arrow1), FadeIn(mlp_box), FadeIn(mlp_label))
-        self.wait(1)
-
-        # ── 20 probability bars ──
-        logits = data["count_logits"][0]  # (20,)
-        probs  = np.exp(logits) / np.exp(logits).sum()
-        pred   = data["pred_count"]
-
-        bars   = VGroup()
-        labels = VGroup()
-        max_p  = probs.max() + 1e-8
+        bars      = VGroup()
+        bar_lbls  = VGroup()   # count index below
+        val_lbls  = VGroup()   # logit value above
 
         for i in range(20):
-            h = (probs[i] / max_p) * 1.8 + 0.05
             color = C_HIGHLIGHT if i == pred else C_DIM
+            h_bar = (logits_shifted[i] / max_l) * 3.5 + 0.05
             bar = Rectangle(
-                width=0.22, height=h,
-                fill_color=color, fill_opacity=0.85,
+                width=0.42, height=h_bar,
+                fill_color=color, fill_opacity=0.85 if i == pred else 0.5,
                 stroke_width=0,
             )
             bars.add(bar)
-            if i % 5 == 0 or i == pred:
-                lbl = Text(str(i), font_size=10, color=color)
-                labels.add(lbl)
+            bar_lbls.add(Text(str(i), font_size=11, color=color))
+            val_lbls.add(Text(f"{logits[i]:.1f}", font_size=9, color=color))
 
-        bars.arrange(RIGHT, buff=0.06, aligned_edge=DOWN)
-        bars.next_to(mlp_box, RIGHT, buff=1.0).shift(DOWN * 0.3)
+        bars.arrange(RIGHT, buff=0.07, aligned_edge=DOWN)
+        bars.move_to(UP * 0.2)
+        for i, bar in enumerate(bars):
+            bar_lbls[i].next_to(bar, DOWN, buff=0.08)
+            val_lbls[i].next_to(bar, UP,   buff=0.05)
 
-        # position count labels below bars
-        for bar in bars:
-            idx = list(bars).index(bar)
-            if idx % 5 == 0 or idx == pred:
-                lbl = Text(str(idx), font_size=10,
-                          color=C_HIGHLIGHT if idx == pred else C_DIM)
-                lbl.next_to(bar, DOWN, buff=0.05)
-                labels.add(lbl)
+        hdr = Text("Raw logits for each count (0–19)  —  higher = more likely",
+                   font_size=14, color=C_WHITE).to_edge(UP, buff=0.7)
 
-        arrow2 = Arrow(mlp_box.get_right(), bars.get_left() + LEFT * 0.1, buff=0.1, color=C_DIM)
-
-        self.play(GrowArrow(arrow2))
+        n4 = narration(
+            f"count=2 logit: {logits[pred]:.1f}   "
+            f"count=1 logit: {logits[1]:.1f}   "
+            f"count=0 logit: {logits[0]:.1f}\n"
+            f"The gap between winner and runner-up = {logits[pred]-logits[1]:.1f} — model is very certain."
+        )
+        self.play(FadeIn(n4), FadeIn(hdr))
         self.play(
             LaggedStart(*[GrowFromEdge(b, DOWN) for b in bars], lag_ratio=0.04),
             run_time=1.5
         )
-        self.wait(0.5)
+        self.play(FadeIn(bar_lbls), FadeIn(val_lbls))
+        self.wait(1)
 
-        # ── highlight winner ──
-        self.play(FadeOut(n2))
-        n3 = narration(f"The model is 100% confident: count = {pred}.\nThe GRU will unroll exactly {pred} times.")
-        self.play(FadeIn(n3))
-
+        # flash winner
         winner_bar = bars[pred]
-        winner_label = Text(f"count = {pred}", font_size=20, color=C_HIGHLIGHT)
-        winner_label.next_to(winner_bar, UP, buff=0.15)
-
         self.play(
             winner_bar.animate.set_fill(C_HIGHLIGHT, opacity=1.0),
-            FadeIn(winner_label),
+            Flash(winner_bar, color=C_HIGHLIGHT, line_length=0.25, num_lines=10),
         )
-        self.wait(2.5)
-        self.play(FadeOut(n3), FadeOut(title))
+        self.wait(2)
+        self.play(FadeOut(n4), FadeOut(bars), FadeOut(bar_lbls),
+                  FadeOut(val_lbls), FadeOut(hdr))
+
+        # ══════════════════════════════════════════════════════════════════
+        # PART 3 — argmax → count → what happens next
+        # ══════════════════════════════════════════════════════════════════
+        summary = VGroup(
+            MathTex(r"\hat{L} = \arg\max_{k} \; \text{logit}_k", font_size=38, color=C_HIGHLIGHT),
+            MathTex(rf"= {pred}", font_size=48, color=C_HIGHLIGHT),
+        ).arrange(DOWN, buff=0.3).move_to(UP * 0.5)
+
+        consequence = Text(
+            f"→ CountLSTMv2 (GRU) unrolls exactly {pred} times\n"
+            f"→ Produces {pred} distinct query vectors, one per instance slot",
+            font_size=20, color=C_WHITE
+        ).move_to(DOWN * 1.5)
+
+        n5 = narration(f"argmax of logits = {pred}.  This single integer controls everything downstream.")
+        self.play(FadeIn(n5))
+        self.play(
+            LaggedStart(*[FadeIn(s, shift=UP*0.1) for s in summary], lag_ratio=0.3),
+            run_time=1.2
+        )
+        self.wait(1)
+        self.play(FadeIn(consequence, shift=UP*0.1))
+        self.wait(3)
+        self.play(FadeOut(n5), FadeOut(summary), FadeOut(consequence), FadeOut(title))
         self.wait(0.5)
 
 
