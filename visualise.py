@@ -117,6 +117,38 @@ def get_model_data():
                 attn_weights[idx] = out[1][0].detach().cpu()
         return hook
 
+    # ── span rep hooks ────────────────────────────────────────────────────
+    span_inter = {}
+    srl = dm.span_rep.span_rep_layer
+
+    def hook_ps(mod, inp, out):
+        span_inter["project_start_out"] = out.detach().cpu()   # (1, text_len, 768)
+    def hook_pe(mod, inp, out):
+        span_inter["project_end_out"]   = out.detach().cpu()
+    def hook_op(mod, inp, out):
+        span_inter["out_project_in"]    = inp[0].detach().cpu()  # (1, 96, 1536)
+        span_inter["out_project_out"]   = out.detach().cpu()     # (1, 96, 768)
+    def hook_sr(mod, inp, out):
+        span_inter["span_rep_final"]    = out.detach().cpu()     # (1, text_len, max_width, 768)
+        span_inter["span_idx"]          = inp[1].detach().cpu()  # (1, 96, 2)
+
+    srl.project_start.register_forward_hook(hook_ps)
+    srl.project_end.register_forward_hook(hook_pe)
+    srl.out_project.register_forward_hook(hook_op)
+    dm.span_rep.register_forward_hook(hook_sr)
+
+    # pull span_rep architecture from live model
+    span_arch = {
+        "mode":        "SpanMarkerV0",
+        "max_width":   dm.max_width,
+        "ps_shapes":   [(tuple(p.shape)) for p in srl.project_start.parameters()],
+        "pe_shapes":   [(tuple(p.shape)) for p in srl.project_end.parameters()],
+        "op_shapes":   [(tuple(p.shape)) for p in srl.out_project.parameters()],
+        "ps_layers":   str(srl.project_start),
+        "pe_layers":   str(srl.project_end),
+        "op_layers":   str(srl.out_project),
+    }
+
     hooks = [dm.encoder.register_forward_hook(hook_enc_out)]
     for i, layer in enumerate(dm.encoder.encoder.layer):
         hooks.append(layer.register_forward_hook(make_layer_hook(i)))
@@ -196,12 +228,37 @@ def get_model_data():
         "field_embs":       d["field_embs"].numpy(),
         "count_logits":     d["count_logits"].numpy(),
         "pred_count":       d["pred_count"],
+        # span representation (from live hooks on SpanMarkerV0)
+        "span_arch":            span_arch,
+        "span_rep_final":       span_inter.get("span_rep_final", torch.zeros(1,1,8,768)).squeeze(0).numpy(),  # (text_len, max_width, 768)
+        "span_norms":           span_inter.get("span_rep_final", torch.zeros(1,1,8,768)).squeeze(0).norm(dim=-1).numpy(),  # (text_len, max_width)
+        "span_idx":             span_inter.get("span_idx", torch.zeros(1,96,2)).numpy(),  # (1, 96, 2)
+        "project_start_out":    span_inter.get("project_start_out", torch.zeros(1,1,768)).squeeze(0).numpy(),  # (text_len, 768)
+        "project_end_out":      span_inter.get("project_end_out",   torch.zeros(1,1,768)).squeeze(0).numpy(),  # (text_len, 768)
+        "out_project_in_norms": span_inter.get("out_project_in",    torch.zeros(1,96,1536)).squeeze(0).norm(dim=-1).numpy(),  # (96,)
+        "out_project_out_norms":span_inter.get("out_project_out",   torch.zeros(1,96,768)).squeeze(0).norm(dim=-1).numpy(),   # (96,)
         # span extraction
         "span_scores":      d["span_scores"].numpy(),
         "struct_proj":      d["struct_proj"].numpy(),
         "gru_out":          _gru_steps.get("investment", torch.zeros(1)).numpy(),
         "text_len":         d["text_len"],
     })
+
+    # precompute per-text-token encoder norms at the last layer
+    start_map = d["start_mapping"]
+    schema_len = len(d["schema_tokens"])
+    text_start_enc = schema_len + 1   # +1 for the [SEP_TEXT] separator
+    hs_last = layer_hidden.get(num_layers - 1)
+    text_tok_enc_norms = []
+    for wt in range(d["text_len"]):
+        sub_i = next((i for i, w in enumerate(start_map) if w == wt), 0)
+        enc_i = text_start_enc + sub_i
+        if hs_last is not None and enc_i < hs_last.shape[0]:
+            text_tok_enc_norms.append(float(np.linalg.norm(hs_last[enc_i].numpy())))
+        else:
+            text_tok_enc_norms.append(20.0)
+    _model_data["text_tok_enc_norms"] = text_tok_enc_norms
+
     print("Model data ready.")
     return _model_data
 
@@ -913,102 +970,292 @@ class CountPredScene(Scene):
 class SpanRepScene(Scene):
     def construct(self):
         self.camera.background_color = C_BG
-        data = get_model_data()
-
-        title = section_title("Scene 4 · Span Representation")
-        self.add(title)
-
-        n1 = narration("The model must score every possible chunk of text.\nThese chunks are called spans.")
-        self.play(FadeIn(n1))
-        self.wait(2)
-
+        data   = get_model_data()
         tokens = data["text_tokens"]
         T      = len(tokens)
-        W      = 8
-        cs     = 0.38
+        W      = data["span_arch"]["max_width"]
+        span_norms      = data["span_norms"]                               # (T, W)
+        ps_out_norms    = np.linalg.norm(data["project_start_out"], axis=-1)  # (T,)
+        pe_out_norms    = np.linalg.norm(data["project_end_out"],   axis=-1)  # (T,)
+        enc_norms       = data["text_tok_enc_norms"]                       # list[T]
 
-        # ── show tokens in a row ──
-        self.play(FadeOut(n1))
-        n2 = narration("The text has " + str(T) + " tokens. With max width 8, that's " + str(T*W) + " possible spans.")
-        self.play(FadeIn(n2))
+        title = section_title("Scene 4 · Span Representation  (SpanMarkerV0)")
+        self.add(title)
 
+        # ══════════════════════════════════════════════════════════════════
+        # PART 1 — token row + span count explanation
+        # ══════════════════════════════════════════════════════════════════
         tok_boxes = VGroup()
-        for i, t in enumerate(tokens):
+        for t in tokens:
             box = RoundedRectangle(
-                corner_radius=0.06,
-                width=max(len(t)*0.13+0.15, 0.4), height=0.38,
-                fill_color=C_TOKEN, fill_opacity=0.2,
+                corner_radius=0.07,
+                width=max(len(t) * 0.14 + 0.18, 0.52), height=0.46,
+                fill_color=C_TOKEN, fill_opacity=0.18,
                 stroke_color=C_TOKEN, stroke_width=1.2,
             )
-            lbl = Text(t, font_size=12, color=C_TOKEN)
-            g = VGroup(box, lbl)
-            tok_boxes.add(g)
+            lbl = Text(t, font_size=14, color=C_TOKEN)
+            lbl.move_to(box)
+            tok_boxes.add(VGroup(box, lbl))
 
-        tok_boxes.arrange(RIGHT, buff=0.08)
-        tok_boxes.scale_to_fit_width(12.5)
-        tok_boxes.move_to(UP * 2)
+        tok_boxes.arrange(RIGHT, buff=0.12)
+        tok_boxes.scale_to_fit_width(12.8)
+        tok_boxes.move_to(UP * 0.8)
+
+        count_lbl = Text(
+            f"{T} tokens  ×  max_width = {W}  =  {T*W} candidate spans",
+            font_size=24, color=C_WHITE,
+        ).move_to(DOWN * 0.5)
+        sub_lbl = Text(
+            "max_width is a training hyperparameter — stored in model.config",
+            font_size=16, color=C_DIM,
+        ).move_to(DOWN * 1.25)
 
         self.play(
-            LaggedStart(*[FadeIn(tb, shift=UP*0.1) for tb in tok_boxes], lag_ratio=0.06),
-            run_time=1.5
+            LaggedStart(*[FadeIn(tb, shift=UP * 0.12) for tb in tok_boxes], lag_ratio=0.06),
+            run_time=1.4,
         )
-        self.wait(0.5)
-
-        # ── span grid ──
-        grid = VGroup()
-        cell_map = {}
-        for w in range(W):
-            for s in range(T):
-                if s + w < T:
-                    cell = Rectangle(
-                        width=cs, height=cs,
-                        fill_color=C_DIM, fill_opacity=0.3,
-                        stroke_color="#333355", stroke_width=0.8,
-                    )
-                    cell.move_to(
-                        RIGHT * (s - T/2 + 0.5) * cs * 0.9 +
-                        DOWN  * (w - W/2 + 0.5) * cs * 0.9 +
-                        DOWN  * 0.5
-                    )
-                    grid.add(cell)
-                    cell_map[(s, w)] = cell
-
-        row_label = Text("width →", font_size=12, color=C_DIM).next_to(grid, RIGHT, buff=0.15)
-        col_label = Text("start ↓", font_size=12, color=C_DIM).rotate(PI/2).next_to(grid, LEFT, buff=0.15)
-
-        self.play(FadeIn(grid), FadeIn(row_label), FadeIn(col_label))
-        self.wait(0.5)
-
-        # ── highlight one example span: $500M (start=2, width=1) ──
-        self.play(FadeOut(n2))
-        n3 = narration("Each cell = one span. E.g. start=2, width=1 → '$ 500m'.\nBoundary token vectors are combined into one span vector.")
-        self.play(FadeIn(n3))
-
-        if (2, 1) in cell_map:
-            example_cell = cell_map[(2, 1)]
-            self.play(example_cell.animate.set_fill(C_HIGHLIGHT, opacity=0.9))
-
-            span_lbl = Text("'$ 500m'", font_size=16, color=C_HIGHLIGHT)
-            span_lbl.next_to(example_cell, RIGHT, buff=0.4)
-            self.play(FadeIn(span_lbl))
-
+        self.play(FadeIn(count_lbl), FadeIn(sub_lbl))
         self.wait(2.5)
+        self.play(FadeOut(sub_lbl), FadeOut(count_lbl))
 
-        # ── all spans → vectors ──
-        self.play(FadeOut(n3))
-        n4 = narration("Every valid span becomes a 768-dim vector. " + str(T*W) + " span vectors in total,\nready to be scored against the field queries.")
-        self.play(FadeIn(n4))
+        # ══════════════════════════════════════════════════════════════════
+        # PART 2 — span norm heatmap
+        # ══════════════════════════════════════════════════════════════════
+        # shrink token row to top so heatmap fits below
+        self.play(tok_boxes.animate.scale(0.78).move_to(UP * 3.0))
 
-        self.play(
-            LaggedStart(
-                *[c.animate.set_fill(C_TOKEN, opacity=0.4)
-                  for c in grid if c != cell_map.get((2,1))],
-                lag_ratio=0.01,
-                run_time=1.5
+        cs       = 0.33            # cell size — 12 rows × 0.33 = 3.96 tall, fits easily
+        max_norm = float(span_norms.max()) + 1e-8
+
+        # grid centered at x≈1.0 (leaves room for row labels on left)
+        ox = 1.0 - (W - 1) / 2.0 * cs   # x of col-0 cell centres
+        oy = 0.3 + (T - 1) / 2.0 * cs   # y of row-0 cell centres (Manim y up)
+
+        grid_cells = VGroup()
+        cell_map   = {}
+        for s in range(T):
+            for w in range(W):
+                is_valid = (s + w) < T
+                norm_val = float(span_norms[s, w]) if is_valid else 0.0
+                color    = val_to_color(norm_val / max_norm) if is_valid else ManimColor(C_DIM)
+                opacity  = 0.85 if is_valid else 0.12
+                cell = Rectangle(
+                    width=cs - 0.03, height=cs - 0.03,
+                    fill_color=color, fill_opacity=opacity,
+                    stroke_color="#222244", stroke_width=0.5,
+                )
+                cell.move_to(RIGHT * (ox + w * cs) + UP * (oy - s * cs))
+                grid_cells.add(cell)
+                cell_map[(s, w)] = (cell, is_valid, norm_val)
+
+        row_labels = VGroup(*[
+            Text(tokens[s], font_size=10, color=C_TOKEN).move_to(
+                RIGHT * (ox - 0.65) + UP * (oy - s * cs))
+            for s in range(T)
+        ])
+        col_labels = VGroup(*[
+            Text(str(w), font_size=9, color=C_DIM).move_to(
+                RIGHT * (ox + w * cs) + UP * (oy + cs * 0.9))
+            for w in range(W)
+        ])
+        axis_lbl = Text("← width →", font_size=11, color=C_DIM).move_to(
+            RIGHT * (ox + (W - 1) / 2.0 * cs) + UP * (oy + cs * 1.7))
+
+        # ── colour legend (vertical gradient bar to the right of the grid) ──
+        legend_x   = ox + W * cs + 0.55          # right of grid + buffer
+        bar_h      = T * cs                       # same height as the grid
+        bar_cy     = oy - (T - 1) / 2.0 * cs     # vertical centre of grid
+        bar_w      = 0.22
+        N_steps    = 20
+        min_norm   = float(span_norms[span_norms > 0].min())
+        legend_bar = VGroup()
+        for i in range(N_steps):
+            frac  = i / (N_steps - 1)
+            seg_h = bar_h / N_steps
+            seg = Rectangle(
+                width=bar_w, height=seg_h,
+                fill_color=val_to_color(frac), fill_opacity=0.9,
+                stroke_width=0,
             )
+            seg.move_to(RIGHT * legend_x + UP * (bar_cy - bar_h / 2 + (i + 0.5) * seg_h))
+            legend_bar.add(seg)
+
+        lbl_high = Text(f"{max_norm * 1:.1f}", font_size=10, color=C_WHITE).next_to(
+            legend_bar, UP, buff=0.06)
+        lbl_low  = Text(f"{min_norm:.1f}",  font_size=10, color=C_WHITE).next_to(
+            legend_bar, DOWN, buff=0.06)
+        lbl_norm = Text("norm", font_size=11, color=C_DIM)
+        lbl_norm.next_to(legend_bar, UP, buff=0.28)
+        legend = VGroup(legend_bar, lbl_high, lbl_low, lbl_norm)
+
+        n_heat = narration(
+            "Row = start token,  Col = span width  (0 = 1 token, 7 = 8 tokens).\n"
+            "Color = L2 norm of final 768-dim span vector — all values from live model."
+        )
+        self.play(FadeIn(n_heat), FadeIn(row_labels), FadeIn(col_labels), FadeIn(axis_lbl))
+        self.play(
+            LaggedStart(*[FadeIn(c) for c in grid_cells], lag_ratio=0.005),
+            run_time=2.0,
+        )
+        self.play(FadeIn(legend))
+        self.wait(1.0)
+
+        # highlight '$ 500m' (start=2, width=1)
+        ex_s, ex_w     = 2, 1
+        ex_cell, _, ex_norm = cell_map[(ex_s, ex_w)]
+        ex_lbl = Text(f"'$ 500m'  norm = {ex_norm:.1f}", font_size=13, color=C_HIGHLIGHT)
+        ex_lbl.next_to(ex_cell, RIGHT, buff=0.4)
+        self.play(FadeOut(n_heat))
+        n_ex = narration(f"'$ 500m': start={ex_s}, width={ex_w}, final vector norm = {ex_norm:.1f}")
+        self.play(FadeIn(n_ex))
+        self.play(
+            ex_cell.animate.set_stroke(C_HIGHLIGHT, width=3),
+            Flash(ex_cell, color=C_HIGHLIGHT, line_length=0.12, num_lines=8),
+            FadeIn(ex_lbl),
         )
         self.wait(2.5)
-        self.play(FadeOut(n4), FadeOut(title))
+        self.play(
+            FadeOut(n_ex), FadeOut(grid_cells), FadeOut(row_labels),
+            FadeOut(col_labels), FadeOut(axis_lbl), FadeOut(ex_lbl),
+            FadeOut(legend), FadeOut(tok_boxes),
+        )
+
+        # ══════════════════════════════════════════════════════════════════
+        # PART 3 — SpanMarkerV0 pipeline (from live model)
+        # ══════════════════════════════════════════════════════════════════
+        # 6-step pipeline as a compact table:  [step name]  [formula/shape]  [description]
+        pipe_rows = [
+            ("Input",         r"h \in \mathbb{R}^{T \times 768}",
+             "DeBERTa last-layer output, all T tokens",            C_DIM),
+            ("project_start", r"h \;\xrightarrow{Lin_{768\to3072}\to ReLU\to Lin_{3072\to768}}\; \mathbb{R}^{T \times 768}",
+             "4× MLP — encodes 'start-token' role",                C_TOKEN),
+            ("project_end",   r"h \;\xrightarrow{Lin_{768\to3072}\to ReLU\to Lin_{3072\to768}}\; \mathbb{R}^{T \times 768}",
+             "same structure, different weights",                   C_SCHEMA),
+            ("gather",        r"\text{torch.gather}\;\Rightarrow\;(96,768)\;\text{each}",
+             f"pick start/end token for each of {T}×{W}={T*W} spans",  C_DIM),
+            ("cat + ReLU",    r"\text{cat}([s,e])\;\in\;\mathbb{{R}}^{{96\times1536}}\;\xrightarrow{{\text{{ReLU}}}}",
+             "merge start+end information",                        C_HIGHLIGHT),
+            ("out_project",   r"\mathbb{R}^{96\times1536}\;\xrightarrow{Lin_{1536\to3072}\to ReLU\to Lin_{3072\to768}}\;\mathbb{R}^{96\times768}",
+             "final 768-dim vector per span",                      C_TOKEN),
+        ]
+
+        pipe_vg = VGroup()
+        for step_name, tex_str, desc_str, color in pipe_rows:
+            name_t  = Text(step_name, font_size=17, color=color, weight=BOLD)
+            formula = MathTex(tex_str, font_size=19, color=color)
+            desc_t  = Text(desc_str, font_size=13, color=C_DIM)
+            row_g   = VGroup(name_t, formula, desc_t)
+            row_g.arrange(RIGHT, buff=0.35)
+            bg = RoundedRectangle(
+                corner_radius=0.07,
+                width=row_g.get_width() + 0.5,
+                height=max(row_g.get_height() + 0.22, 0.52),
+                fill_color=color, fill_opacity=0.07,
+                stroke_color=color, stroke_width=0.8,
+            )
+            bg.move_to(row_g)
+            pipe_vg.add(VGroup(bg, row_g))
+
+        pipe_vg.arrange(DOWN, buff=0.14)
+        # scale to fit width (14.2 available, use 13.5 max) without inflating height
+        if pipe_vg.get_width() > 13.5:
+            pipe_vg.scale_to_fit_width(13.5)
+        pipe_vg.move_to(ORIGIN)
+
+        n_pipe = narration(
+            "project_start ≠ project_end — different weights, different roles.\n"
+            "Both MLPs run on ALL T tokens first, then gather — efficient batched operation."
+        )
+        self.play(FadeIn(n_pipe))
+        self.play(
+            LaggedStart(*[FadeIn(b, shift=DOWN * 0.08) for b in pipe_vg], lag_ratio=0.1),
+            run_time=2.2,
+        )
+        self.wait(3.5)
+        self.play(FadeOut(n_pipe), FadeOut(pipe_vg))
+
+        # ══════════════════════════════════════════════════════════════════
+        # PART 4 — Trace '$ 500m' through pipeline (proper fork diagram)
+        # ══════════════════════════════════════════════════════════════════
+        start_tok, end_tok = 2, 3
+        ps_norm    = float(ps_out_norms[start_tok])
+        pe_norm    = float(pe_out_norms[end_tok])
+        h_s_norm   = float(enc_norms[start_tok])
+        h_e_norm   = float(enc_norms[end_tok])
+        final_norm = float(span_norms[ex_s, ex_w])
+        # concat input norm ≈ sqrt(ps_norm² + pe_norm²) — not captured separately, derive it
+        cat_in_norm = float(np.sqrt(ps_norm**2 + pe_norm**2))
+
+        def make_box(label, color, w=3.0, h=0.88):
+            box = RoundedRectangle(
+                corner_radius=0.1, width=w, height=h,
+                fill_color=color, fill_opacity=0.13,
+                stroke_color=color, stroke_width=1.4,
+            )
+            lbl = Text(label, font_size=12, color=color)
+            lbl.move_to(box)
+            return VGroup(box, lbl)
+
+        # Two parallel input columns, then merge
+        LX, RX = -3.2, 3.2    # x positions for start / end columns
+        Y0, Y1 = 2.4, 0.9     # y for row 0 (input tokens) and row 1 (projection outputs)
+        Y2, Y3 = -0.7, -2.2   # y for cat+ReLU and out_project (centred)
+
+        b_hs  = make_box(f"DeBERTa h[{start_tok}]  '{tokens[start_tok]}'\nnorm = {h_s_norm:.1f}", C_TOKEN)
+        b_he  = make_box(f"DeBERTa h[{end_tok}]  '{tokens[end_tok]}'\nnorm = {h_e_norm:.1f}", C_SCHEMA)
+        b_ps  = make_box(f"project_start  →  768-dim\nnorm = {ps_norm:.1f}", C_TOKEN)
+        b_pe  = make_box(f"project_end  →  768-dim\nnorm = {pe_norm:.1f}", C_SCHEMA)
+        b_cat = make_box(f"cat([start, end])  →  1536-dim   ReLU\nnorm ≈ {cat_in_norm:.1f}", C_HIGHLIGHT, w=4.8)
+        b_out = make_box(f"out_project  →  768-dim\nnorm = {final_norm:.1f}", C_HIGHLIGHT, w=4.8)
+
+        b_hs.move_to( RIGHT * LX + UP * Y0)
+        b_he.move_to( RIGHT * RX + UP * Y0)
+        b_ps.move_to( RIGHT * LX + UP * Y1)
+        b_pe.move_to( RIGHT * RX + UP * Y1)
+        b_cat.move_to(UP * Y2)
+        b_out.move_to(UP * Y3)
+
+        # labels above the two columns
+        lbl_start = Text("start-token path", font_size=14, color=C_TOKEN)
+        lbl_start.move_to(RIGHT * LX + UP * (Y0 + 0.7))
+        lbl_end = Text("end-token path", font_size=14, color=C_SCHEMA)
+        lbl_end.move_to(RIGHT * RX + UP * (Y0 + 0.7))
+
+        arrows = [
+            Arrow(b_hs.get_bottom(),  b_ps.get_top(),   buff=0.05, color=C_TOKEN,    stroke_width=1.6),
+            Arrow(b_he.get_bottom(),  b_pe.get_top(),   buff=0.05, color=C_SCHEMA,   stroke_width=1.6),
+            Arrow(b_ps.get_bottom(),  b_cat.get_left(), buff=0.05, color=C_TOKEN,    stroke_width=1.6),
+            Arrow(b_pe.get_bottom(),  b_cat.get_right(),buff=0.05, color=C_SCHEMA,   stroke_width=1.6),
+            Arrow(b_cat.get_bottom(), b_out.get_top(),  buff=0.05, color=C_HIGHLIGHT, stroke_width=1.6),
+        ]
+
+        n_trace = narration(
+            "Two independent paths (start token, end token) through identical-structure MLPs.\n"
+            "Different weights → different roles.  cat merges them → one 768-dim span vector."
+        )
+        self.play(FadeIn(n_trace), FadeIn(lbl_start), FadeIn(lbl_end))
+        self.play(
+            LaggedStart(FadeIn(b_hs), FadeIn(b_he), lag_ratio=0.2),
+        )
+        self.play(
+            LaggedStart(GrowArrow(arrows[0]), GrowArrow(arrows[1]), lag_ratio=0.1),
+            LaggedStart(FadeIn(b_ps), FadeIn(b_pe), lag_ratio=0.2),
+        )
+        self.play(
+            LaggedStart(GrowArrow(arrows[2]), GrowArrow(arrows[3]), lag_ratio=0.05),
+        )
+        self.play(FadeIn(b_cat))
+        self.play(GrowArrow(arrows[4]))
+        self.play(FadeIn(b_out))
+        self.wait(3)
+        self.play(
+            FadeOut(n_trace),
+            FadeOut(lbl_start), FadeOut(lbl_end),
+            FadeOut(b_hs), FadeOut(b_he), FadeOut(b_ps), FadeOut(b_pe),
+            FadeOut(b_cat), FadeOut(b_out),
+            *[FadeOut(a) for a in arrows],
+            FadeOut(title),
+        )
         self.wait(0.5)
 
 
