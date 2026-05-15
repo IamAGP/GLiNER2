@@ -1521,108 +1521,196 @@ class SpanScoreScene(Scene):
         title = section_title("Scene 6 · Span Scoring")
         self.add(title)
 
-        n1 = narration("Each instance query vector is dotted against every span vector.\nThe result is a score grid — the span heatmap.")
-        self.play(FadeIn(n1))
-        self.wait(2)
-        self.play(FadeOut(n1))
-
-        span_scores = data["span_scores"]  # (L, M, T, W)
+        span_scores = data["span_scores"]   # (L, M, T, W)
         tokens      = data["text_tokens"]
         text_len    = data["text_len"]
         fields      = data["field_names"]
         L, M, T, W  = span_scores.shape
-        cs          = 0.32
 
+        # ══════════════════════════════════════════════════════════════════
+        # PART 1 — formula
+        # ══════════════════════════════════════════════════════════════════
+        formula = MathTex(
+            r"\text{score}[l,k,t,w] = \sigma\!\left(\,"
+            r"\underbrace{\text{struct\_proj}[l,k]}_{\text{instance-field query (768-d)}} \cdot"
+            r"\underbrace{\text{span\_rep}[t,w]}_{\text{span vector (768-d)}}"
+            r"\,\right)",
+            font_size=26, color=C_WHITE,
+        ).move_to(UP * 1.5)
+
+        # index legend
+        idx_legend = VGroup(
+            Text("l  =  instance slot    (0 … L-1)", font_size=15, color=C_HIGHLIGHT),
+            Text("k  =  field index      (0 … M-1)", font_size=15, color=C_TOKEN),
+            Text("t  =  span start token (0 … T-1)", font_size=15, color=C_SCHEMA),
+            Text("w  =  span width       (0 … W-1)", font_size=15, color=C_WHITE),
+        ).arrange(DOWN, aligned_edge=LEFT, buff=0.18).move_to(UP * 0.1)
+
+        shape_lbl = Text(
+            f"Result: (L={L}, M={M}, T={text_len}, W={W})  →  "
+            f"{L}×{M}×{text_len}×{W} = {L*M*text_len*W} scores in one batched einsum",
+            font_size=15, color=C_DIM,
+        ).move_to(DOWN * 1.4)
+
+        n1 = narration(
+            f"struct_proj[l,k] is the 768-d query for instance l, field k — output of CountLSTMv2.\n"
+            f"span_rep[t,w] is the 768-d vector for the span starting at token t with width w+1.\n"
+            f"Their dot product, passed through sigmoid, gives the probability that span (t,w) fills field k of instance l."
+        )
+        self.play(FadeIn(n1), FadeIn(formula))
+        self.play(FadeIn(idx_legend))
+        self.play(FadeIn(shape_lbl))
+        self.wait(4.0)
+        self.play(FadeOut(n1), FadeOut(formula), FadeOut(idx_legend), FadeOut(shape_lbl))
+
+        # ══════════════════════════════════════════════════════════════════
+        # PART 2 — all L×M heatmaps shown simultaneously in a 2×2 grid
+        # ══════════════════════════════════════════════════════════════════
+        cs    = 0.20   # cell size — 12×0.20=2.4 tall, 8×0.20=1.6 wide: fits 2×2
+
+        # grid layout: col = field index, row = instance index
+        # centres of each mini-heatmap
+        col_gap, row_gap = 4.2, 3.5
+        grid_cx = [(k - (M-1)/2) * col_gap for k in range(M)]
+        grid_cy = [(l - (L-1)/2) * (-row_gap) for l in range(L)]
+
+        # field color palette (tied to field index, not hardcoded name)
+        fcolors = [C_TOKEN, C_SCHEMA]
+
+        all_cells  = {}   # (l, k, t, w) -> Rectangle
+        all_grids  = VGroup()
+        all_labels = VGroup()
+
+        # column headers (field names)
+        for k, fname in enumerate(fields):
+            hdr = Text(fname, font_size=16, color=fcolors[k], weight=BOLD)
+            hdr.move_to(RIGHT * grid_cx[k] + UP * (grid_cy[0] + text_len*cs/2 + 0.5))
+            all_labels.add(hdr)
+
+        # row headers (instance slots)
+        for l in range(L):
+            hdr = Text(f"Instance {l+1}", font_size=14, color=C_DIM)
+            hdr.move_to(RIGHT * (grid_cx[0] - 8*cs/2 - 0.9) + UP * grid_cy[l])
+            all_labels.add(hdr)
+
+        # build each mini-heatmap
         for l in range(L):
             for k in range(M):
-                sc = span_scores[l, k, :text_len, :]  # (T, W)
+                sc  = span_scores[l, k, :text_len, :]
+                cx  = grid_cx[k]
+                cy  = grid_cy[l]
+                mini = VGroup()
 
-                n_inst = narration(
-                    f"Instance {l+1}, field '{fields[k]}' — "
-                    f"scoring all {text_len}×{W} spans."
-                )
-                self.play(FadeIn(n_inst))
-
-                # build grid
-                grid = VGroup()
-                cells = {}
                 for t in range(text_len):
                     for w in range(W):
                         val   = float(sc[t, w])
                         color = val_to_color(val)
                         cell  = Rectangle(
-                            width=cs, height=cs,
+                            width=cs-0.02, height=cs-0.02,
                             fill_color=color,
-                            fill_opacity=0.9 if val > 0.01 else 0.2,
-                            stroke_color="#222244",
-                            stroke_width=0.5,
+                            fill_opacity=0.9 if val > 0.01 else 0.15,
+                            stroke_color="#222244", stroke_width=0.4,
                         )
                         cell.move_to(
-                            RIGHT * (w - W/2 + 0.5) * (cs + 0.02) +
-                            DOWN  * (t - text_len/2 + 0.5) * (cs + 0.02)
+                            RIGHT * (cx + (w - (W-1)/2) * cs) +
+                            UP    * (cy + ((text_len-1)/2 - t) * cs)
                         )
-                        grid.add(cell)
-                        cells[(t, w)] = cell
+                        mini.add(cell)
+                        all_cells[(l, k, t, w)] = cell
 
-                # row labels (token names)
-                row_labels = VGroup()
-                for t, tok in enumerate(tokens[:text_len]):
-                    lbl = Text(tok, font_size=9, color=C_DIM)
-                    lbl.next_to(cells[(t, 0)], LEFT, buff=0.1)
-                    row_labels.add(lbl)
+                all_grids.add(mini)
 
-                # col labels (widths)
-                col_labels = VGroup()
-                for w in range(W):
-                    lbl = Text(f"w{w}", font_size=9, color=C_DIM)
-                    lbl.next_to(cells[(0, w)], UP, buff=0.08)
-                    col_labels.add(lbl)
+        # row labels (token names) on the leftmost column only
+        row_lbls = VGroup()
+        for t, tok in enumerate(tokens[:text_len]):
+            lbl = Text(tok, font_size=8, color=C_DIM)
+            lbl.move_to(
+                RIGHT * (grid_cx[0] - (W-1)/2*cs - 0.45) +
+                UP    * (grid_cy[0] + ((text_len-1)/2 - t) * cs)
+            )
+            row_lbls.add(lbl)
 
-                inst_label = Text(
-                    f"Instance {l+1} · '{fields[k]}'",
-                    font_size=18, color=C_WHITE,
-                ).to_edge(UP, buff=0.6)
+        # axis annotation: "width →" below first heatmap in each column
+        axis_lbls = VGroup()
+        for k in range(M):
+            ax = Text("← width →", font_size=8, color=C_DIM)
+            ax.move_to(
+                RIGHT * grid_cx[k] +
+                UP    * (grid_cy[0] + text_len*cs/2 + 0.22)
+            )
+            axis_lbls.add(ax)
 
-                self.play(
-                    FadeIn(inst_label),
-                    FadeIn(row_labels),
-                    FadeIn(col_labels),
+        n2 = narration(
+            "4 heatmaps — one per (instance slot, field).\n"
+            "Each row = a token in the text.  Each column = span width (1 token, 2 tokens … 8).\n"
+            "Bright yellow cell = that span scored ≥ 0.5 for that query.\n"
+            "Notice Instance 1 lights up near '$' / 'stripe' — Instance 2 lights up near '$' / 'spacex'.\n"
+            "CountLSTMv2 generated distinct queries, so different spans win for each instance."
+        )
+        self.play(FadeIn(n2), FadeIn(all_labels), FadeIn(row_lbls), FadeIn(axis_lbls))
+        self.play(
+            LaggedStart(*[FadeIn(g) for g in all_grids], lag_ratio=0.15),
+            run_time=2.0,
+        )
+        self.wait(3.0)
+
+        # ── flash winners in all panels simultaneously ──────────────────
+        # Real model: torch.where(scores >= threshold), take first above threshold.
+        # If none pass, output is None for that field.
+        THRESHOLD = 0.5
+        winner_flashes = []
+        winner_lbls    = VGroup()
+        flash_cells    = []
+        for l in range(L):
+            for k in range(M):
+                sc   = span_scores[l, k, :text_len, :]
+                # find all (t, w) above threshold, pick first in scan order
+                above = np.where(sc >= THRESHOLD)
+                if len(above[0]) > 0:
+                    bt = int(above[0][0])
+                    bw = int(above[1][0])
+                    be = bt + bw + 1
+                    span_txt = " ".join(tokens[bt:be]) if be <= len(tokens) else "?"
+                    score    = float(sc[bt, bw])
+                    lbl_str  = f"'{span_txt}'  {score:.2f}"
+                    lbl_col  = C_HIGHLIGHT
+                else:
+                    # no span passes threshold — model outputs None
+                    bt, bw = 0, 0
+                    lbl_str = "— (below threshold)"
+                    lbl_col = C_DIM
+                    score   = float(sc.max())
+
+                cell = all_cells[(l, k, bt, bw)]
+                winner_flashes.append(
+                    cell.animate.set_stroke(lbl_col, width=2.5)
                 )
-                self.play(
-                    LaggedStart(
-                        *[FadeIn(cell) for cell in grid],
-                        lag_ratio=0.01,
-                        run_time=1.5,
-                    )
+                if lbl_col == C_HIGHLIGHT:
+                    flash_cells.append(cell)
+                lbl = Text(lbl_str, font_size=11, color=lbl_col)
+                lbl.move_to(
+                    RIGHT * grid_cx[k] +
+                    UP    * (grid_cy[l] - text_len*cs/2 - 0.28)
                 )
-                self.wait(0.5)
+                winner_lbls.add(lbl)
 
-                # highlight winner
-                flat  = sc[:text_len, :].reshape(-1)
-                best  = int(flat.argmax())
-                bt, bw = divmod(best, W)
-                be    = bt + bw + 1
-                span_txt = " ".join(tokens[bt:be]) if be <= len(tokens) else "?"
-
-                self.play(FadeOut(n_inst))
-                n_win = narration(
-                    f"Winner: '{span_txt}' at position {bt}, width {bw} — score {float(flat[best]):.3f}"
-                )
-                self.play(FadeIn(n_win))
-
-                if (bt, bw) in cells:
-                    winner = cells[(bt, bw)]
-                    self.play(
-                        winner.animate.set_stroke(C_HIGHLIGHT, width=3),
-                        Flash(winner, color=C_HIGHLIGHT, line_length=0.15, num_lines=8),
-                    )
-                self.wait(2)
-                self.play(
-                    FadeOut(grid), FadeOut(row_labels), FadeOut(col_labels),
-                    FadeOut(inst_label), FadeOut(n_win),
-                )
-
-        self.play(FadeOut(title))
+        self.play(FadeOut(n2))
+        n3 = narration(
+            "Model scans each heatmap row-by-row, left-to-right — picks the FIRST cell ≥ 0.5.\n"
+            "'First' means shortest span starting earliest, matching the model's scan order.\n"
+            "No cell ≥ 0.5 anywhere → field output is None for that slot."
+        )
+        self.play(FadeIn(n3))
+        self.play(
+            *winner_flashes,
+            *[Flash(c, color=C_HIGHLIGHT, line_length=0.1, num_lines=6) for c in flash_cells],
+        )
+        self.play(FadeIn(winner_lbls))
+        self.wait(3)
+        self.play(
+            FadeOut(n3), FadeOut(all_grids), FadeOut(all_labels),
+            FadeOut(row_lbls), FadeOut(winner_lbls), FadeOut(title), FadeOut(axis_lbls),
+        )
         self.wait(0.5)
 
 
@@ -1650,32 +1738,46 @@ class OutputScene(Scene):
         text_len  = data["text_len"]
         L, M, T, W = span_sc.shape
 
-        # find winners
+        # find winners — mirrors real model: torch.where(scores >= 0.5), take first
+        THRESHOLD = 0.5
         results = []
         for l in range(L):
             inst = {}
             for k, fname in enumerate(fields):
-                sc   = span_sc[l, k, :text_len, :]
-                flat = sc.reshape(-1)
-                best = int(flat.argmax())
-                bt, bw = divmod(best, W)
-                be   = bt + bw + 1
-                inst[fname] = " ".join(tokens[bt:be]) if be <= len(tokens) else "?"
+                sc    = span_sc[l, k, :text_len, :]
+                above = np.where(sc >= THRESHOLD)
+                if len(above[0]) > 0:
+                    bt = int(above[0][0])
+                    bw = int(above[1][0])
+                    be = bt + bw + 1
+                    inst[fname] = " ".join(tokens[bt:be]) if be <= len(tokens) else "?"
+                else:
+                    inst[fname] = None
             results.append(inst)
+
+        # color palette per field — tied to index, not hardcoded name
+        field_colors = [C_TOKEN, C_SCHEMA]
+
+        # find all winning span ranges: (bt, be, field_color)
+        win_ranges = []
+        for l in range(L):
+            for k in range(M):
+                sc    = span_sc[l, k, :text_len, :]
+                above = np.where(sc >= THRESHOLD)
+                if len(above[0]) > 0:
+                    bt = int(above[0][0])
+                    bw = int(above[1][0])
+                    be = bt + bw + 1
+                    win_ranges.append((bt, be, field_colors[k % len(field_colors)], fields[k]))
 
         # show sentence with highlighted spans
         sentence_tokens = VGroup()
         for i, tok in enumerate(tokens):
             color = C_WHITE
-            # check if this token is a winner
-            for l in range(L):
-                for k, fname in enumerate(fields):
-                    sc   = span_sc[l, k, :text_len, :]
-                    flat = sc.reshape(-1)
-                    best = int(flat.argmax())
-                    bt, bw = divmod(best, W)
-                    if bt <= i <= bt + bw:
-                        color = C_HIGHLIGHT if k == 0 else C_SCHEMA
+            for bt, be, fc, _ in win_ranges:
+                if bt <= i < be:
+                    color = fc
+                    break
             lbl = Text(tok, font_size=18, color=color)
             sentence_tokens.add(lbl)
 
@@ -1714,7 +1816,8 @@ class OutputScene(Scene):
 
         instance_groups.arrange(RIGHT, buff=0.5).move_to(DOWN * 0.5)
 
-        n2 = narration("Two investment instances extracted — each with amount and company fields.")
+        field_list = "  +  ".join(f"'{f}'" for f in fields)
+        n2 = narration(f"L={L} investment instances extracted — fields: {field_list}.")
         self.play(FadeIn(n2))
         self.play(
             LaggedStart(*[FadeIn(ig, shift=UP*0.2) for ig in instance_groups], lag_ratio=0.3),
