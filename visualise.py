@@ -75,7 +75,8 @@ def get_model_data():
 
     import sys, os
     sys.path.insert(0, os.path.dirname(__file__))
-    from debug_counting import DebugGLiNER2, _schema_debug, _gru_steps, _transformer_out
+    from debug_counting import (DebugGLiNER2, _schema_debug, _gru_steps, _transformer_out,
+                                _current_schema, _hook_gru, _hook_transformer)
 
     print("Loading model for visualisation data...")
     dm = DebugGLiNER2.from_pretrained(MODEL)
@@ -153,6 +154,10 @@ def get_model_data():
     for i, layer in enumerate(dm.encoder.encoder.layer):
         hooks.append(layer.register_forward_hook(make_layer_hook(i)))
         hooks.append(layer.attention.self.register_forward_hook(make_attn_hook(i)))
+
+    # GRU + transformer hooks (same mechanism as debug_counting.py manual registration)
+    hooks.append(dm.count_embed.gru.register_forward_hook(_hook_gru))
+    hooks.append(dm.count_embed.transformer.register_forward_hook(_hook_transformer))
 
     # enable attention weight output via config flag
     dm.encoder.config.output_attentions = True
@@ -1268,116 +1273,239 @@ class GRUUnrollScene(Scene):
         self.camera.background_color = C_BG
         data = get_model_data()
 
-        title = section_title("Scene 5 · CountLSTMv2 — GRU Unrolling")
+        title = section_title("Scene 5 · CountLSTMv2 — Instance Query Generation")
         self.add(title)
 
-        n1 = narration("CountLSTMv2 takes the field embeddings and unrolls the GRU\nonce per predicted instance.")
+        fields      = data["field_names"]
+        pred_count  = data["pred_count"]
+        gru_out     = data["gru_out"]      # (L, M, 768) after GRU, before residual+transformer
+        struct_proj = data["struct_proj"]  # (L, M, 768) final output after transformer
+        M = len(fields)
+        L = pred_count
+
+        C_POS = "#cc88ff"   # purple for positional embeddings
+
+        # ══════════════════════════════════════════════════════════════════
+        # PART 1 — the problem: why do we need L distinct queries?
+        # ══════════════════════════════════════════════════════════════════
+        problem_q = Text(
+            f"Count prediction said: L = {L} instances.",
+            font_size=28, color=C_WHITE,
+        ).move_to(UP * 1.2)
+        problem_a = Text(
+            f"We need {L} different search queries —\none for each investment in the text.",
+            font_size=24, color=C_DIM,
+        ).move_to(DOWN * 0.2)
+        problem_b = Text(
+            "If both queries are identical, they find the same spans → wrong.",
+            font_size=20, color=C_SCHEMA,
+        ).move_to(DOWN * 1.3)
+
+        n1 = narration("CountLSTMv2's job: manufacture L distinct query vectors from a single schema.")
         self.play(FadeIn(n1))
-        self.wait(2)
+        self.play(FadeIn(problem_q))
+        self.play(FadeIn(problem_a))
+        self.play(FadeIn(problem_b))
+        self.wait(3)
+        self.play(FadeOut(n1), FadeOut(problem_q), FadeOut(problem_a), FadeOut(problem_b))
 
-        fields     = data["field_names"]
-        pred_count = data["pred_count"]
-        gru_out    = data["gru_out"]   # (L, M, 768)
-        M          = len(fields)
-        L          = pred_count
+        # ══════════════════════════════════════════════════════════════════
+        # PART 2 — GRU unrolled as a time diagram (step 0 → step 1)
+        # ══════════════════════════════════════════════════════════════════
+        # Layout (left to right = time):
+        #   [h₀ = field_embs]  →  [GRU cell 0]  →  [GRU cell 1]  →  ...
+        #   pos_emb[0] ↑              pos_emb[1] ↑
 
-        # ── field embeddings (input) ──
-        self.play(FadeOut(n1))
-        n2 = narration("Input: one 768-dim embedding per field — 'amount' and 'company'.")
+        n2 = narration(
+            "GRU unrolled over time.  Each step gets a different positional embedding as input.\n"
+            "The field embeddings are the STARTING hidden state — not the input sequence."
+        )
         self.play(FadeIn(n2))
 
-        field_boxes = VGroup()
-        for fname in fields:
-            box = RoundedRectangle(
-                corner_radius=0.1, width=1.8, height=0.5,
-                fill_color=C_SCHEMA, fill_opacity=0.25,
-                stroke_color=C_SCHEMA, stroke_width=1.5,
-            )
-            lbl = Text(fname, font_size=16, color=C_SCHEMA)
-            lbl.move_to(box)
-            field_boxes.add(VGroup(box, lbl))
+        # h0 box (field embeddings = initial hidden state)
+        h0_bg = RoundedRectangle(corner_radius=0.1, width=2.2, height=1.6,
+                                  fill_color=C_SCHEMA, fill_opacity=0.15,
+                                  stroke_color=C_SCHEMA, stroke_width=1.5)
+        h0_bg.move_to(LEFT * 5.0 + UP * 0.3)
+        h0_lbl  = Text("h₀", font_size=26, color=C_SCHEMA, weight=BOLD).move_to(h0_bg.get_center() + UP * 0.3)
+        h0_desc = Text("field embeddings\n(what to look for)", font_size=11, color=C_SCHEMA).move_to(h0_bg.get_center() + DOWN * 0.3)
 
-        field_boxes.arrange(DOWN, buff=0.2).move_to(LEFT * 4)
-        input_lbl = Text("field embeddings\n(M=2, D=768)", font_size=13, color=C_DIM)
-        input_lbl.next_to(field_boxes, UP, buff=0.2)
+        # GRU cells (one per step)
+        cell_xs = [-1.8 + l * 3.2 for l in range(L)]
+        cell_y  = 0.3
+        gru_cells = VGroup()
+        for l in range(L):
+            bg = RoundedRectangle(corner_radius=0.12, width=2.4, height=1.6,
+                                   fill_color=C_HIGHLIGHT, fill_opacity=0.1,
+                                   stroke_color=C_HIGHLIGHT, stroke_width=1.8)
+            bg.move_to(RIGHT * cell_xs[l] + UP * cell_y)
+            t1 = Text(f"GRU step {l}", font_size=16, color=C_HIGHLIGHT, weight=BOLD)
+            t2 = Text(f"(M={M} fields)", font_size=12, color=C_DIM)
+            VGroup(t1, t2).arrange(DOWN, buff=0.1).move_to(bg)
+            gru_cells.add(VGroup(bg, t1, t2))
 
-        self.play(FadeIn(field_boxes), FadeIn(input_lbl))
-        self.wait(1)
+        # positional embedding labels (arrow from below into each cell)
+        pos_lbls = VGroup()
+        pos_arrows = VGroup()
+        for l in range(L):
+            lbl = Text(f"pos_emb[{l}]", font_size=13, color=C_POS)
+            lbl.move_to(RIGHT * cell_xs[l] + UP * (cell_y - 1.5))
+            arr = Arrow(lbl.get_top(), gru_cells[l].get_bottom(), buff=0.08,
+                        color=C_POS, stroke_width=1.6)
+            pos_lbls.add(lbl)
+            pos_arrows.add(arr)
 
-        # ── GRU box ──
-        gru_box = RoundedRectangle(
-            corner_radius=0.2, width=2.5, height=2,
-            fill_color="#0d1117", fill_opacity=1,
-            stroke_color=C_HIGHLIGHT, stroke_width=2,
-        ).move_to(ORIGIN)
-        gru_lbl = Text("GRU", font_size=26, color=C_HIGHLIGHT)
-        gru_sub = Text("+ Transformer", font_size=14, color=C_DIM)
-        VGroup(gru_lbl, gru_sub).arrange(DOWN, buff=0.1).move_to(gru_box)
+        pos_header = Text("↑ GRU sequence input (step index → pos embedding)",
+                          font_size=13, color=C_POS)
+        pos_header.move_to(DOWN * 2.4)
 
-        arrow_in = Arrow(field_boxes.get_right(), gru_box.get_left(), buff=0.15, color=C_DIM)
+        # h0 → cell 0 arrow
+        arr_h0 = Arrow(h0_bg.get_right(), gru_cells[0].get_left(), buff=0.1,
+                       color=C_SCHEMA, stroke_width=1.8)
+        lbl_h0_arr = Text("h₀", font_size=13, color=C_SCHEMA)
+        lbl_h0_arr.next_to(arr_h0, UP, buff=0.06)
 
+        # cell → cell arrows (hidden state passing)
+        between_arrows = VGroup()
+        between_lbls   = VGroup()
+        for l in range(L - 1):
+            arr = Arrow(gru_cells[l].get_right(), gru_cells[l + 1].get_left(),
+                        buff=0.1, color=C_HIGHLIGHT, stroke_width=1.8)
+            lbl = Text(f"h_{l+1}", font_size=13, color=C_HIGHLIGHT)
+            lbl.next_to(arr, UP, buff=0.06)
+            between_arrows.add(arr)
+            between_lbls.add(lbl)
+
+        # output arrows (right of last cell)
+        out_arrow = Arrow(gru_cells[-1].get_right(),
+                          gru_cells[-1].get_right() + RIGHT * 1.2,
+                          buff=0.0, color=C_HIGHLIGHT, stroke_width=1.8)
+        out_lbl = Text(f"(L={L}, M={M}, D=768)", font_size=12, color=C_DIM)
+        out_lbl.next_to(out_arrow, UP, buff=0.06)
+
+        self.play(FadeIn(h0_bg), FadeIn(h0_lbl), FadeIn(h0_desc))
+        self.play(GrowArrow(arr_h0), FadeIn(lbl_h0_arr))
+        for l in range(L):
+            self.play(FadeIn(gru_cells[l]), run_time=0.5)
+            self.play(FadeIn(pos_lbls[l]), GrowArrow(pos_arrows[l]), run_time=0.4)
+            if l < L - 1:
+                self.play(GrowArrow(between_arrows[l]), FadeIn(between_lbls[l]), run_time=0.4)
+        self.play(GrowArrow(out_arrow), FadeIn(out_lbl), FadeIn(pos_header))
+        self.wait(3)
         self.play(FadeOut(n2))
-        n3 = narration("The GRU unrolls once per instance slot, producing distinct query vectors.")
-        self.play(FadeIn(n3), FadeIn(gru_box), FadeIn(gru_lbl), FadeIn(gru_sub), GrowArrow(arrow_in))
-        self.wait(1)
 
-        # ── output columns (one per step) ──
-        step_groups = VGroup()
+        unroll_all = VGroup(h0_bg, h0_lbl, h0_desc, arr_h0, lbl_h0_arr,
+                            gru_cells, pos_lbls, pos_arrows, pos_header,
+                            between_arrows, between_lbls, out_arrow, out_lbl)
+        self.play(FadeOut(unroll_all))
+
+        # ══════════════════════════════════════════════════════════════════
+        # PART 3 — DownscaledTransformer: what it ACTUALLY does (verified)
+        # Empirically confirmed: input (L, M, D) with batch_first=True →
+        #   batch=L, seq=M.  Attention runs over M (fields), NOT over L (instances).
+        #   Instances are independent batch elements — zero cross-instance interaction.
+        # ══════════════════════════════════════════════════════════════════
+
+        # Pre-compute real values
+        if gru_out.ndim == 3:
+            v0_gru = gru_out[0].flatten()
+            v1_gru = gru_out[1].flatten()
+            sim_before = float(np.dot(v0_gru, v1_gru) /
+                               (np.linalg.norm(v0_gru) * np.linalg.norm(v1_gru) + 1e-8))
+        else:
+            sim_before = 0.0
+
+        if struct_proj.ndim == 3:
+            v0_fin = struct_proj[0].flatten()
+            v1_fin = struct_proj[1].flatten()
+            sim_after = float(np.dot(v0_fin, v1_fin) /
+                              (np.linalg.norm(v0_fin) * np.linalg.norm(v1_fin) + 1e-8))
+        else:
+            sim_after = sim_before
+
+        n3 = narration(
+            "DownscaledTransformer: batch_first=True, input (L, M, D) → batch=L, seq=M.\n"
+            "Attention runs over M fields — instances are independent. GRU created the diversity."
+        )
+        self.play(FadeIn(n3))
+
+        # ── show two SEPARATE instance boxes, fields talking WITHIN each ──
+        inst_xs = [-3.0, 3.0]
+        inst_colors = [C_HIGHLIGHT, C_TOKEN]
+        field_colors = [C_SCHEMA, C_TOKEN]
+        inst_groups = VGroup()
+
         for l in range(L):
-            col = VGroup()
-            for k in range(M):
-                # show norm as bar height
-                norm = float(np.linalg.norm(gru_out[l, k])) if gru_out.ndim == 3 else 1.0
-                bar = Rectangle(
-                    width=0.6, height=min(norm / 20, 1.5) + 0.2,
-                    fill_color=C_HIGHLIGHT if l == 0 else C_TOKEN,
-                    fill_opacity=0.8, stroke_width=0,
-                )
-                lbl = Text(f"inst {l+1}\n{fields[k]}", font_size=10, color=C_DIM)
-                lbl.next_to(bar, DOWN, buff=0.05)
-                col.add(VGroup(bar, lbl))
-            col.arrange(DOWN, buff=0.2)
-            step_groups.add(col)
+            ix = inst_xs[l]
+            ic = inst_colors[l]
 
-        step_groups.arrange(RIGHT, buff=0.4).next_to(gru_box, RIGHT, buff=1.0)
+            # Instance header
+            hdr = Text(f"Instance slot {l+1}", font_size=15, color=ic, weight=BOLD)
+            hdr.move_to(RIGHT * ix + UP * 2.4)
 
-        pos_labels = VGroup()
-        for l in range(L):
-            pl = Text(f"step {l}", font_size=12, color=C_DIM)
-            pl.next_to(step_groups[l], UP, buff=0.15)
-            pos_labels.add(pl)
+            # Two field circles inside this instance
+            f_circles = VGroup()
+            f_lbls    = VGroup()
+            for k, fname in enumerate(fields):
+                fc = Circle(radius=0.6,
+                            fill_color=field_colors[k], fill_opacity=0.15,
+                            stroke_color=field_colors[k], stroke_width=1.8)
+                fy = 0.9 - k * 1.8
+                fc.move_to(RIGHT * ix + UP * fy)
+                fl = Text(fname, font_size=13, color=field_colors[k])
+                fl.move_to(fc)
+                f_circles.add(fc)
+                f_lbls.add(fl)
 
+            # Cross-field arrows (within this instance only)
+            cf_arr1 = CurvedArrow(f_circles[0].get_right() + DOWN * 0.2,
+                                  f_circles[1].get_right() + UP * 0.2,
+                                  angle=TAU / 5, color=ic, stroke_width=1.3)
+            cf_arr2 = CurvedArrow(f_circles[1].get_left() + UP * 0.2,
+                                  f_circles[0].get_left() + DOWN * 0.2,
+                                  angle=TAU / 5, color=ic, stroke_width=1.3)
+            cf_lbl = Text("cross-field\nattention", font_size=11, color=C_DIM)
+            cf_lbl.move_to(RIGHT * (ix + 1.3) + UP * 0.0)
+
+            inst_groups.add(VGroup(hdr, f_circles, f_lbls, cf_arr1, cf_arr2, cf_lbl))
+
+        # Vertical divider between instances — they are INDEPENDENT
+        divider = DashedLine(UP * 2.8, DOWN * 2.5, color=C_DIM, stroke_width=1.0)
+        divider.move_to(ORIGIN)
+        no_cross = Text("✕  no cross-instance interaction", font_size=14, color=C_DIM)
+        no_cross.move_to(UP * 3.1)
+
+        self.play(
+            LaggedStart(*[FadeIn(ig) for ig in inst_groups], lag_ratio=0.3),
+            run_time=1.5,
+        )
+        self.play(FadeIn(divider), FadeIn(no_cross))
+        self.wait(2.5)
+
+        # ── show instance diversity was made by the GRU (cosine before vs after) ──
         self.play(FadeOut(n3))
-        n4 = narration("Step 0: query vectors for instance 1.\nStep 1: different vectors for instance 2 — shaped by memory of step 0.")
+        n4 = narration(
+            f"GRU output cosine = {sim_before:.3f}  →  after transformer = {sim_after:.3f}.\n"
+            f"Transformer pushes further apart — not by cross-instance talk, but by applying different field-attention to already-different instances."
+        )
         self.play(FadeIn(n4))
 
-        arrow_out = Arrow(gru_box.get_right(), step_groups.get_left(), buff=0.1, color=C_DIM)
-        self.play(GrowArrow(arrow_out))
+        delta = sim_after - sim_before
+        sign  = "+" if delta >= 0 else ""
+        sim_vg = VGroup(
+            Text(f"After GRU:          instance1 ↔ instance2  cosine = {sim_before:.3f}",
+                 font_size=16, color=C_DIM),
+            Text(f"After Transformer:  instance1 ↔ instance2  cosine = {sim_after:.3f}  ({sign}{delta:.3f})",
+                 font_size=16, color=C_WHITE),
+        )
+        sim_vg.arrange(DOWN, buff=0.3).move_to(DOWN * 2.0)
+        self.play(FadeIn(sim_vg))
+        self.wait(3.5)
 
-        for l in range(L):
-            self.play(
-                FadeIn(step_groups[l], shift=RIGHT * 0.15),
-                FadeIn(pos_labels[l]),
-                run_time=0.6,
-            )
-            self.wait(0.4)
-
-        self.wait(1)
-
-        # ── cosine similarity callout ──
-        if gru_out.ndim == 3 and L >= 2:
-            v0 = gru_out[0].flatten()
-            v1 = gru_out[1].flatten()
-            sim = float(np.dot(v0, v1) / (np.linalg.norm(v0) * np.linalg.norm(v1) + 1e-8))
-            self.play(FadeOut(n4))
-            n5 = narration(f"Cross-step cosine similarity = {sim:.3f}.\nValues below 0.7 mean the two query vectors are meaningfully distinct.")
-            self.play(FadeIn(n5))
-            self.wait(3)
-            self.play(FadeOut(n5))
-        else:
-            self.play(FadeOut(n4))
-
-        self.play(FadeOut(title))
+        self.play(
+            FadeOut(n4), FadeOut(inst_groups), FadeOut(divider),
+            FadeOut(no_cross), FadeOut(sim_vg), FadeOut(title),
+        )
         self.wait(0.5)
 
 
